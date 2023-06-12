@@ -1,0 +1,24 @@
+[package]
+name = "ssp-server"
+version = "0.1.1"
+edition = "2021"
+authors = ["SSP Rust Developers"]
+description = "Reference server implementation for the SSP/eSSP serial communication protocol"
+keywords = ["serial", "ssp", "bill-acceptor", "bill-validator"]
+categories = ["network-programming"]
+repository = "https://github.com/ssp-rs/ssp-server"
+license = "MIT"
+
+[dependencies]
+env_logger = "0.10"
+log = "0.4"
+parking_lot = "0.12"
+serialport = { version = "4.2", default-features = false }
+
+[dependencies.ssp]
+version = "0.1"
+features = ["std"]
+
+[features]
+test-e2e = []
+test-rainbow = []
