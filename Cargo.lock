@@ -537,6 +537,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bebd363326d05ec3e2f532ab7660680f3b02130d780c299bca73469d521bc0ed"
 
 [[package]]
+name = "serde"
+version = "1.0.164"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e8c8cf938e98f769bc164923b06dce91cea1751522f46f8466461af04c9027d"
+dependencies = [
+ "serde_derive",
+]
+
+[[package]]
+name = "serde_derive"
+version = "1.0.164"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9735b638ccc51c28bf6914d90a2e9725b377144fc612c49a611fddd1b631d68"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "serialport"
 version = "4.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -565,6 +585,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "signal-hook"
+version = "0.3.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "732768f1176d21d09e076c23a93123d40bba92d50c4058da34d45c8de8e682b9"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
+name = "signal-hook-registry"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8229b473baa5980ac72ef434c4415e70c4b5e71b423043adb4ba059f89c99a1"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -581,9 +620,7 @@ dependencies = [
 
 [[package]]
 name = "ssp"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "251cecd1ff75ddb907684269b24209d6acfc18f8c814a493af1f384a879c8d7d"
+version = "0.2.0"
 dependencies = [
  "aes",
  "bitfield",
@@ -592,9 +629,11 @@ dependencies = [
  "log",
  "num-bigint",
  "num-traits",
+ "parking_lot",
  "pbkdf2",
  "rand",
  "rand_chacha",
+ "serde",
  "serialport",
  "sha2",
  "zeroize",
@@ -602,12 +641,13 @@ dependencies = [
 
 [[package]]
 name = "ssp-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "env_logger",
  "log",
  "parking_lot",
  "serialport",
+ "signal-hook",
  "ssp",
 ]
 

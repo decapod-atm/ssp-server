@@ -2,8 +2,8 @@
 
 use std::io::{Read, Write};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+    atomic::{AtomicBool, AtomicU32, Ordering},
+    mpsc, Arc,
 };
 use std::thread;
 use std::time;
@@ -12,6 +12,10 @@ use parking_lot::{Mutex, MutexGuard};
 use serialport::TTYPort;
 
 use ssp::{CommandOps, MessageOps, ResponseOps, Result};
+
+use crate::{continue_on_err, encryption_key};
+
+mod inner;
 
 /// Timeout for waiting for lock on a mutex (milliseconds).
 pub const LOCK_TIMEOUT_MS: u64 = 5_000;
@@ -22,11 +26,16 @@ pub const MIN_POLLING_MS: u64 = 200;
 /// Maximum polling interval between messages (milliseconds).
 #[allow(dead_code)]
 pub const MAX_POLLING_MS: u64 = 1_000;
+/// Timeout for retrieving an event from a queue (milliseconds)
+pub const QUEUE_TIMEOUT_MS: u128 = 5_000;
 /// Default serial connection BAUD rate (bps).
 pub const BAUD_RATE: u32 = 9_600;
 
 pub(crate) static SEQ_FLAG: AtomicBool = AtomicBool::new(false);
 static POLLING_INIT: AtomicBool = AtomicBool::new(false);
+
+static ESCROWED: AtomicBool = AtomicBool::new(false);
+static ESCROWED_AMOUNT: AtomicU32 = AtomicU32::new(0);
 
 pub(crate) fn sequence_flag() -> ssp::SequenceFlag {
     SEQ_FLAG.load(Ordering::Relaxed).into()
@@ -46,28 +55,96 @@ fn set_polling_inited(inited: bool) {
     POLLING_INIT.store(inited, Ordering::SeqCst);
 }
 
-// Convenience macro to get a Option<&ssp::AesKey> from the device handle.
-//
-// If the encryption key is unset, returns `None`.
-macro_rules! encryption_key {
-    ($handle:tt) => {{
-        $handle.encryption_key()?.as_ref()
-    }};
+pub(crate) fn escrowed() -> bool {
+    ESCROWED.load(Ordering::Relaxed)
 }
 
-macro_rules! continue_on_err {
-    ($res:expr, $err:tt) => {{
-        match $res {
-            Ok(res) => res,
-            Err(err) => {
-                let err_msg = $err;
-                log::warn!("{err_msg}: {err}");
-                continue;
+pub(crate) fn set_escrowed(escrowed: bool) -> bool {
+    let last = ESCROWED.load(Ordering::Relaxed);
+    ESCROWED.store(escrowed, Ordering::SeqCst);
+    last
+}
+
+pub(crate) fn escrowed_amount() -> ssp::ChannelValue {
+    ESCROWED_AMOUNT.load(Ordering::Relaxed).into()
+}
+
+pub(crate) fn set_escrowed_amount(amount: ssp::ChannelValue) -> ssp::ChannelValue {
+    let last = ssp::ChannelValue::from(ESCROWED_AMOUNT.load(Ordering::Relaxed));
+    ESCROWED_AMOUNT.store(amount.into(), Ordering::SeqCst);
+    last
+}
+
+/// Polling interactivity mode.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PollMode {
+    /// Automically handle polling events.
+    Auto,
+    /// Interactively handle polling events.
+    Interactive,
+}
+
+/// Receiver end of the device-sent event queue.
+///
+/// Owner of the receiver can regularly attempt to pop events from the queue,
+/// and decide how to handle an returned event(s).
+///
+/// Example:
+///
+/// ```rust, no_run
+/// # use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+/// # fn main() -> ssp::Result<()> {
+/// let stop_polling = Arc::new(AtomicBool::new(false));
+/// let poll_mode = ssp_server::PollMode::Interactive;
+///
+/// let mut handle = ssp_server::DeviceHandle::new("/dev/ttyUSB0")?;
+///
+/// let rx: ssp_server::PushEventReceiver = handle.start_background_polling_with_queue(
+///     Arc::clone(&stop_polling),
+///     poll_mode,
+/// )?;
+///
+/// // Pop events from the queue
+/// loop {
+///     while let Ok(event) = rx.pop_event() {
+///         log::debug!("Received an event: {event}");
+///         // do stuff in response to the event...
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub struct PushEventReceiver(pub mpsc::Receiver<ssp::Event>);
+
+impl PushEventReceiver {
+    /// Creates a new [PushEventReceiver] from the provided `queue`.
+    pub fn new(queue: mpsc::Receiver<ssp::Event>) -> Self {
+        Self(queue)
+    }
+
+    /// Attempt to pop an event from the queue.
+    ///
+    /// Returns `Err(_)` if an event could not be retrieved before the timeout.
+    pub fn pop_event(&self) -> Result<ssp::Event> {
+        let now = time::Instant::now();
+        let queue = &self.0;
+
+        while now.elapsed().as_millis() < QUEUE_TIMEOUT_MS {
+            if let Ok(evt) = queue.try_recv() {
+                return Ok(evt);
             }
         }
-    }};
+
+        Err(ssp::Error::QueueTimeout)
+    }
 }
 
+/// Handle for communicating with a SSP-enabled device over serial.
+///
+/// ```no_run
+/// let _handle = ssp_server::DeviceHandle::new("/dev/ttyUSB0").unwrap();
+/// ```
 pub struct DeviceHandle {
     serial_port: Arc<Mutex<TTYPort>>,
     generator: ssp::GeneratorKey,
@@ -128,9 +205,23 @@ impl DeviceHandle {
     /// - `stop_polling`: used to control when the polling routine should stop sending polling messages.
     ///
     /// If background polling has already started, the function just returns.
+    ///
+    /// Example:
+    ///
+    /// ```rust, no_run
+    /// # use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    /// # fn main() -> ssp::Result<()> {
+    /// let stop_polling = Arc::new(AtomicBool::new(false));
+    ///
+    /// let handle = ssp_server::DeviceHandle::new("/dev/ttyUSB0")?;
+    ///
+    /// handle.start_background_polling(Arc::clone(&stop_polling))?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn start_background_polling(&self, stop_polling: Arc<AtomicBool>) -> Result<()> {
         if polling_inited() {
-            Ok(())
+            Err(ssp::Error::PollingReinit)
         } else {
             // Set the global flag to disallow multiple background polling threads.
             set_polling_inited(true);
@@ -155,39 +246,30 @@ impl DeviceHandle {
 
                         let mut message = ssp::PollCommand::new();
 
-                        if let Some(key) = key.as_ref() {
-                            match Self::poll_encrypted_message(&mut locked_port, &mut message, key)
-                            {
-                                Ok(response) => {
-                                    let poll_res = continue_on_err!(response.into_poll_response(), "Failed to convert to poll response in background polling routine");
-                                    let last_statuses = poll_res.last_response_statuses();
-
-                                    log::debug!("Successful encrypted poll command, last statuses: {last_statuses}");
-                                }
-                                Err(err) => {
-                                    log::warn!("Failed encrypted poll command: {err}");
-                                }
-                            }
+                        let res = if let Some(key) = key.as_ref() {
+                            continue_on_err!(
+                                Self::poll_encrypted_message(&mut locked_port, &mut message, key),
+                                "Failed poll command in background polling routine"
+                            )
                         } else {
-                            let res = continue_on_err!(
+                            continue_on_err!(
                                 Self::poll_message_variant(&mut locked_port, &mut message),
                                 "Failed poll command in background polling routine"
+                            )
+                        };
+
+                        let status = res.as_response().response_status();
+
+                        if status.is_ok() {
+                            let poll_res = continue_on_err!(
+                                res.into_poll_response(),
+                                "Failed to convert poll response in background polling routine"
                             );
-                            let status = res.as_response().response_status();
+                            let last_statuses = poll_res.last_response_statuses();
 
-                            if status.is_ok() {
-                                let poll_res = continue_on_err!(
-                                    res.into_poll_response(),
-                                    "Failed to convert poll response in background polling routine"
-                                );
-                                let last_statuses = poll_res.last_response_statuses();
-
-                                log::debug!(
-                                    "Successful poll command, last statuses: {last_statuses}"
-                                );
-                            } else {
-                                log::warn!("Failed poll command, response status: {status}");
-                            }
+                            log::debug!("Successful poll command, last statuses: {last_statuses}");
+                        } else {
+                            log::warn!("Failed poll command, response status: {status}");
                         }
                     }
                 }
@@ -200,6 +282,121 @@ impl DeviceHandle {
             });
 
             Ok(())
+        }
+    }
+
+    /// Starts background polling routine to regularly send [PollCommand] messages to the device,
+    /// with an additional event queue for sending push events from the device to the host.
+    ///
+    /// **Args**
+    ///
+    /// - `stop_polling`: used to control when the polling routine should stop sending polling messages.
+    ///
+    /// If background polling has already started, the function just returns.
+    ///
+    /// Returns an event queue receiver that the caller can use to receive device-sent events.
+    ///
+    /// Example:
+    ///
+    /// ```rust, no_run
+    /// # use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    /// # fn main() -> ssp::Result<()> {
+    /// let stop_polling = Arc::new(AtomicBool::new(false));
+    /// let poll_mode = ssp_server::PollMode::Interactive;
+    ///
+    /// let handle = ssp_server::DeviceHandle::new("/dev/ttyUSB0")?;
+    ///
+    /// let rx = handle.start_background_polling_with_queue(
+    ///     Arc::clone(&stop_polling),
+    ///     poll_mode,
+    /// )?;
+    ///
+    /// // Pop events from the queue
+    /// loop {
+    ///     while let Ok(event) = rx.pop_event() {
+    ///         log::debug!("Received an event: {event}");
+    ///         // do stuff in response to the event...
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn start_background_polling_with_queue(
+        &self,
+        stop_polling: Arc<AtomicBool>,
+        poll_mode: PollMode,
+    ) -> Result<PushEventReceiver> {
+        if polling_inited() {
+            Err(ssp::Error::PollingReinit)
+        } else {
+            // Set the global flag to disallow multiple background polling threads.
+            set_polling_inited(true);
+
+            let serial_port = Arc::clone(&self.serial_port);
+            let end_polling = Arc::clone(&stop_polling);
+            let key = Arc::clone(&self.key);
+
+            let (tx, rx) = mpsc::channel();
+
+            thread::spawn(move || -> Result<()> {
+                let now = time::Instant::now();
+
+                while !end_polling.load(Ordering::Relaxed) {
+                    if now.elapsed().as_millis() % MIN_POLLING_MS as u128 == 0 {
+                        if escrowed() && poll_mode == PollMode::Interactive {
+                            // Do not automatically poll when device has a bill in escrow,
+                            // and the user is in interactive mode.
+                            //
+                            // Sending a poll with bill in escrow stacks the bill.
+                            //
+                            // Sit in a busy loop until the user sends a stack/reject command.
+                            continue;
+                        }
+                        let mut locked_port = continue_on_err!(
+                            Self::lock_serial_port(&serial_port),
+                            "Failed to lock serial port in background polling routine"
+                        );
+                        let key = continue_on_err!(
+                            Self::lock_encryption_key(&key),
+                            "Failed to lock encryption key in background polling routine"
+                        );
+
+                        let mut message = ssp::PollCommand::new();
+
+                        let res = if let Some(key) = key.as_ref() {
+                            continue_on_err!(
+                                Self::poll_encrypted_message(&mut locked_port, &mut message, key),
+                                "Failed encrypted poll command"
+                            )
+                        } else {
+                            continue_on_err!(
+                                Self::poll_message_variant(&mut locked_port, &mut message),
+                                "Failed poll command in background polling routine"
+                            )
+                        };
+
+                        let status = res.as_response().response_status();
+                        if status.is_ok() {
+                            let poll_res = continue_on_err!(
+                                res.into_poll_response(),
+                                "Failed to convert poll response in background polling routine"
+                            );
+
+                            Self::parse_events(&poll_res, &tx)?;
+                        } else {
+                            log::warn!("Failed poll command, response status: {status}");
+                        }
+                    }
+                }
+
+                // Now that polling finished, reset the flag to allow another background routine to
+                // start.
+                set_polling_inited(false);
+
+                Ok(())
+            });
+
+            Ok(PushEventReceiver::new(rx))
         }
     }
 
@@ -289,6 +486,21 @@ impl DeviceHandle {
             key.take()
         } else {
             None
+        }
+    }
+
+    /// Sends a command to stack a bill in escrow.
+    pub fn stack(&mut self) -> Result<ssp::ChannelValue> {
+        let mut serial_port = self.serial_port()?;
+
+        let mut message = ssp::PollCommand::new();
+        let res = Self::poll_message(&mut serial_port, &mut message, encryption_key!(self))?;
+
+        let status = res.as_response().response_status();
+        if status.is_ok() {
+            Ok(set_escrowed_amount(ssp::ChannelValue::default()))
+        } else {
+            Err(ssp::Error::InvalidStatus((status, ssp::ResponseStatus::Ok)))
         }
     }
 
@@ -615,7 +827,17 @@ impl DeviceHandle {
 
         let response = Self::poll_message(&mut serial_port, &mut message, encryption_key!(self))?;
 
-        response.into_setup_request_response()
+        let res = response.into_setup_request_response()?;
+
+        // configure global channel values
+        let chan_vals = match res.protocol_version()? as u8 {
+            0..=5 | 0xff => res.channel_values()?,
+            _ => res.channel_values_long()?,
+        };
+
+        ssp::configure_channels(chan_vals.as_ref())?;
+
+        Ok(res)
     }
 
     /// Send a [UnitDataCommand](ssp::UnitDataCommand) message to the device.
@@ -637,7 +859,11 @@ impl DeviceHandle {
 
         let response = Self::poll_message(&mut serial_port, &mut message, encryption_key!(self))?;
 
-        response.into_channel_value_data_response()
+        let res = response.into_channel_value_data_response()?;
+
+        ssp::configure_channels(res.channel_values()?.as_ref())?;
+
+        Ok(res)
     }
 
     /// Send a [LastRejectCodeCommand](ssp::LastRejectCodeCommand) message to the device.
@@ -828,7 +1054,7 @@ impl DeviceHandle {
         }
 
         let wrapped_res = response.into_wrapped_encrypted_message()?;
-        let dec_res = ssp::EncryptedResponse::decrypt(&key, wrapped_res);
+        let dec_res = ssp::EncryptedResponse::decrypt(key, wrapped_res);
 
         let mut res = ssp::MessageVariant::new(message.command());
         res.as_response_mut().set_data(dec_res.data())?;
