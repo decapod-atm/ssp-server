@@ -6,7 +6,9 @@ use ssp::MessageOps;
 
 use crate::continue_on_err;
 
-use super::{set_escrowed, set_escrowed_amount, DeviceHandle};
+use super::{
+    cashbox_available, set_cashbox_available, set_escrowed, set_escrowed_amount, DeviceHandle,
+};
 
 impl DeviceHandle {
     pub(crate) fn parse_events(
@@ -21,7 +23,24 @@ impl DeviceHandle {
         //
         // Just in case multiple events are returned, keep parsing to the end of the data array.
         while idx < data_len {
-            match ssp::ResponseStatus::from(data[idx]) {
+            let status = ssp::ResponseStatus::from(data[idx]);
+
+            if !(cashbox_available()
+                || status == ssp::ResponseStatus::Disabled
+                || status == ssp::ResponseStatus::StackerFull
+                || status == ssp::ResponseStatus::CashboxRemoved)
+            {
+                set_cashbox_available(true);
+
+                log::debug!("Cashbox is available: {status}");
+
+                continue_on_err!(
+                    tx.send(ssp::Event::from(ssp::CashboxReplacedEvent::new())),
+                    "Failed to send CashboxReplaced event"
+                );
+            }
+
+            match status {
                 ssp::ResponseStatus::DeviceReset => {
                     let event = continue_on_err!(
                         ssp::ResetEvent::try_from(data[idx..].as_ref()),
@@ -45,13 +64,13 @@ impl DeviceHandle {
                     if value.as_inner() != 0 {
                         // Change the global escrow state
                         set_escrowed(true);
-                        set_escrowed_amount(*value);
-                    }
+                        set_escrowed_amount(value);
 
-                    continue_on_err!(
-                        tx.send(ssp::Event::from(event)),
-                        "Failed to send Read event"
-                    );
+                        continue_on_err!(
+                            tx.send(ssp::Event::from(event)),
+                            "Failed to send Read event"
+                        );
+                    }
                 }
                 ssp::ResponseStatus::NoteCredit => {
                     let event = continue_on_err!(
@@ -62,7 +81,7 @@ impl DeviceHandle {
 
                     // Bill moved from escrow to storage, modify global escrow state.
                     set_escrowed(false);
-                    set_escrowed_amount(*event.value());
+                    set_escrowed_amount(event.value());
 
                     continue_on_err!(
                         tx.send(ssp::Event::from(event)),
@@ -74,33 +93,46 @@ impl DeviceHandle {
                         ssp::CashboxRemovedEvent::try_from(data[idx..].as_ref()),
                         "Failed to parse CashboxRemoved event"
                     );
+
                     idx += ssp::CashboxRemovedEvent::len();
-                    continue_on_err!(
-                        tx.send(ssp::Event::from(event)),
-                        "Failed to send CashboxRemoved event"
-                    );
+
+                    if cashbox_available() {
+                        log::debug!("Cashbox is removed");
+
+                        set_cashbox_available(false);
+
+                        continue_on_err!(
+                            tx.send(ssp::Event::from(event)),
+                            "Failed to send CashboxRemoved event"
+                        );
+                    }
                 }
                 ssp::ResponseStatus::CashboxReplaced => {
                     let event = continue_on_err!(
                         ssp::CashboxReplacedEvent::try_from(data[idx..].as_ref()),
                         "Failed to parse CashboxReplaced event"
                     );
+
                     idx += ssp::CashboxReplacedEvent::len();
-                    continue_on_err!(
-                        tx.send(ssp::Event::from(event)),
-                        "Failed to send CashboxReplaced event"
-                    );
+
+                    if !cashbox_available() {
+                        log::debug!("Cashbox replaced");
+
+                        set_cashbox_available(true);
+
+                        continue_on_err!(
+                            tx.send(ssp::Event::from(event)),
+                            "Failed to send CashboxReplaced event"
+                        );
+                    }
                 }
                 ssp::ResponseStatus::Disabled => {
                     let event = continue_on_err!(
                         ssp::DisabledEvent::try_from(data[idx..].as_ref()),
                         "Failed to parse Disabled event"
                     );
+                    log::trace!("Device is disabled: {event}");
                     idx += ssp::DisabledEvent::len();
-                    continue_on_err!(
-                        tx.send(ssp::Event::from(event)),
-                        "Failed to send Disabled event"
-                    );
                 }
                 ssp::ResponseStatus::FraudAttempt => {
                     let event = continue_on_err!(
@@ -142,12 +174,9 @@ impl DeviceHandle {
                     );
                     idx += ssp::RejectedEvent::len();
 
-                    set_escrowed(false);
+                    log::trace!("Received Rejected event: {event}");
 
-                    continue_on_err!(
-                        tx.send(ssp::Event::from(event)),
-                        "Failed to send Rejected event"
-                    );
+                    set_escrowed(false);
                 }
                 ssp::ResponseStatus::Rejecting => {
                     let event = continue_on_err!(
@@ -156,12 +185,9 @@ impl DeviceHandle {
                     );
                     idx += ssp::RejectingEvent::len();
 
-                    set_escrowed(false);
+                    log::trace!("Received Rejecting event: {event}");
 
-                    continue_on_err!(
-                        tx.send(ssp::Event::from(event)),
-                        "Failed to send Rejecting event"
-                    );
+                    set_escrowed(false);
                 }
                 ssp::ResponseStatus::Stacked => {
                     let event = continue_on_err!(
@@ -170,23 +196,31 @@ impl DeviceHandle {
                     );
                     idx += ssp::StackedEvent::len();
 
-                    set_escrowed(false);
+                    log::trace!("Received Stacked event: {event}");
 
-                    continue_on_err!(
-                        tx.send(ssp::Event::from(event)),
-                        "Failed to send Stacked event"
-                    );
+                    set_escrowed(false);
                 }
                 ssp::ResponseStatus::StackerFull => {
                     let event = continue_on_err!(
                         ssp::StackerFullEvent::try_from(data[idx..].as_ref()),
                         "Failed to parse StackerFull event"
                     );
-                    continue_on_err!(
-                        tx.send(ssp::Event::from(event)),
-                        "Failed to send StackerFull event"
-                    );
                     idx += ssp::StackerFullEvent::len();
+
+                    if cashbox_available() {
+                        // Some firmware/protocol versions seem to send this message for the
+                        // cashbox being removed, and the stacker being full. TBD.
+                        log::debug!(
+                            "Cashbox is unavailable. It was either removed, or the stacker is full"
+                        );
+
+                        set_cashbox_available(false);
+
+                        continue_on_err!(
+                            tx.send(ssp::Event::from(event)),
+                            "Failed to send StackerFull event"
+                        );
+                    }
                 }
                 ssp::ResponseStatus::Stacking => {
                     let event = continue_on_err!(
@@ -195,12 +229,9 @@ impl DeviceHandle {
                     );
                     idx += ssp::StackingEvent::len();
 
-                    set_escrowed(false);
+                    log::trace!("Received Stacking event: {event}");
 
-                    continue_on_err!(
-                        tx.send(ssp::Event::from(event)),
-                        "Failed to send Stacking event"
-                    );
+                    set_escrowed(false);
                 }
                 ssp::ResponseStatus::UnsafeJam => {
                     let event = continue_on_err!(

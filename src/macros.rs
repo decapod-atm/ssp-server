@@ -11,7 +11,7 @@ macro_rules! encryption_key {
 /// Continues to next loop iteration on an `Err(_)` result.
 #[macro_export]
 macro_rules! continue_on_err {
-    ($res:expr, $err:tt) => {{
+    ($res:expr, $err:expr) => {{
         match $res {
             Ok(res) => res,
             Err(err) => {
