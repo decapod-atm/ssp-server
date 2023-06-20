@@ -399,13 +399,48 @@ fn test_e2e_server() -> Result<(), Vec<ssp::Error>> {
 #[cfg(feature = "test-rainbow")]
 #[test]
 fn test_rainbow_dance() -> ssp::Result<()> {
-    use std::{thread, time};
+    use std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        thread, time,
+    };
 
     common::init();
 
     let mut handle = ssp_server::DeviceHandle::new("/dev/ttyUSB0")?;
 
-    let ram = ssp::BezelConfigStorage::Ram;
+    let stop_polling = Arc::new(AtomicBool::new(false));
+
+    handle.host_protocol_version(ssp::ProtocolVersion::Eight)?;
+
+    match handle.setup_request() {
+        Ok(setup) => log::info!("Device status: {setup}"),
+        Err(err) => log::error!("Error retrieving device status: {err}"),
+    }
+
+    match handle.serial_number() {
+        Ok(sn) => log::info!("Device serial number: {sn}"),
+        Err(err) => log::error!("Error retrieving device status: {err}"),
+    }
+
+    handle.start_background_polling(Arc::clone(&stop_polling))?;
+
+    let enable_list = ssp::EnableBitfieldList::from([
+        ssp::EnableBitfield::from(0xff),
+        ssp::EnableBitfield::from(0xff),
+        ssp::EnableBitfield::from(0xff),
+    ]);
+
+    match handle.set_inhibits(enable_list) {
+        Ok(res) => {
+            log::debug!("Set inhibits command for 24 channels succeeded: {res}");
+        }
+        Err(err) => {
+            log::error!("Failed set inhibits command for 24 channels: {err}");
+        }
+    }
 
     handle.enable()?;
 
@@ -419,6 +454,8 @@ fn test_rainbow_dance() -> ssp::Result<()> {
     let range = start..=end;
 
     let now = time::Instant::now();
+
+    let ram = ssp::BezelConfigStorage::Ram;
 
     for b in range.clone().step_by(blue_step) {
         for g in range.clone().step_by(green_step) {
@@ -446,6 +483,8 @@ fn test_rainbow_dance() -> ssp::Result<()> {
     }
 
     thread::sleep(time::Duration::from_millis(delay));
+
+    stop_polling.store(true, Ordering::SeqCst);
 
     handle.reset()?;
 

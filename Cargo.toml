@@ -10,15 +10,41 @@ repository = "https://github.com/ssp-rs/ssp-server"
 license = "MIT"
 
 [dependencies]
+bus = "2.4"
 env_logger = "0.10"
 log = "0.4"
 parking_lot = "0.12"
 serialport = { version = "4.2", default-features = false }
+signal-hook = "0.3"
 
 [dependencies.ssp]
+version = "0.2"
+features = ["std"]
+
+[dependencies.serde_json]
+version = "1.0"
+features = ["std"]
+optional = true
+
+[dependencies.smol-jsonrpc]
 version = "0.1"
 features = ["std"]
+optional = true
 
 [features]
 test-e2e = []
 test-rainbow = []
+jsonrpc = ["serde_json", "smol-jsonrpc", "ssp/jsonrpc"]
+
+[lib]
+name = "ssp_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "auto_ssp_server"
+path = "src/bin/auto_server.rs"
+
+[[bin]]
+name = "jsonrpc_ssp_server"
+path = "src/bin/jsonrpc_server.rs"
+required-features = ["jsonrpc"]

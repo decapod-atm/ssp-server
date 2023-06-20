@@ -1,9 +1,11 @@
 #![allow(dead_code)]
 
 use std::io::{Read, Write};
+#[cfg(feature = "jsonrpc")]
+use std::os::unix::net::UnixStream;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
+    mpsc, Arc,
 };
 use std::thread;
 use std::time;
@@ -11,7 +13,16 @@ use std::time;
 use parking_lot::{Mutex, MutexGuard};
 use serialport::TTYPort;
 
+#[cfg(feature = "jsonrpc")]
+use smol_jsonrpc::{Request, Response};
+
+#[cfg(feature = "jsonrpc")]
+use ssp::jsonrpc::{jsonrpc_id, set_jsonrpc_id};
 use ssp::{CommandOps, MessageOps, ResponseOps, Result};
+
+use crate::{continue_on_err, encryption_key};
+
+mod inner;
 
 /// Timeout for waiting for lock on a mutex (milliseconds).
 pub const LOCK_TIMEOUT_MS: u64 = 5_000;
@@ -22,11 +33,27 @@ pub const MIN_POLLING_MS: u64 = 200;
 /// Maximum polling interval between messages (milliseconds).
 #[allow(dead_code)]
 pub const MAX_POLLING_MS: u64 = 1_000;
+/// Timeout for retrieving an event from a queue (milliseconds)
+pub const QUEUE_TIMEOUT_MS: u128 = 5_000;
 /// Default serial connection BAUD rate (bps).
 pub const BAUD_RATE: u32 = 9_600;
 
 pub(crate) static SEQ_FLAG: AtomicBool = AtomicBool::new(false);
 static POLLING_INIT: AtomicBool = AtomicBool::new(false);
+
+static ESCROWED: AtomicBool = AtomicBool::new(false);
+static ESCROWED_AMOUNT: AtomicU32 = AtomicU32::new(0);
+
+static CASHBOX_AVAILABLE: AtomicBool = AtomicBool::new(true);
+
+// Time when a device reset was initiated.
+static RESET_TIME: AtomicU64 = AtomicU64::new(0);
+// Timeout for waiting for the device to reset (seconds).
+const RESET_TIMEOUT_SECS: u64 = 60;
+
+static PROTOCOL_VERSION: AtomicU8 = AtomicU8::new(6);
+
+static INTERACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn sequence_flag() -> ssp::SequenceFlag {
     SEQ_FLAG.load(Ordering::Relaxed).into()
@@ -46,28 +73,140 @@ fn set_polling_inited(inited: bool) {
     POLLING_INIT.store(inited, Ordering::SeqCst);
 }
 
-// Convenience macro to get a Option<&ssp::AesKey> from the device handle.
-//
-// If the encryption key is unset, returns `None`.
-macro_rules! encryption_key {
-    ($handle:tt) => {{
-        $handle.encryption_key()?.as_ref()
-    }};
+pub(crate) fn escrowed() -> bool {
+    ESCROWED.load(Ordering::Relaxed)
 }
 
-macro_rules! continue_on_err {
-    ($res:expr, $err:tt) => {{
-        match $res {
-            Ok(res) => res,
-            Err(err) => {
-                let err_msg = $err;
-                log::warn!("{err_msg}: {err}");
-                continue;
+pub(crate) fn set_escrowed(escrowed: bool) -> bool {
+    let last = ESCROWED.load(Ordering::Relaxed);
+    ESCROWED.store(escrowed, Ordering::SeqCst);
+    last
+}
+
+pub(crate) fn escrowed_amount() -> ssp::ChannelValue {
+    ESCROWED_AMOUNT.load(Ordering::Relaxed).into()
+}
+
+pub(crate) fn set_escrowed_amount(amount: ssp::ChannelValue) -> ssp::ChannelValue {
+    let last = ssp::ChannelValue::from(ESCROWED_AMOUNT.load(Ordering::Relaxed));
+    ESCROWED_AMOUNT.store(amount.into(), Ordering::SeqCst);
+    last
+}
+
+pub(crate) fn cashbox_available() -> bool {
+    CASHBOX_AVAILABLE.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_cashbox_available(available: bool) -> bool {
+    let last = cashbox_available();
+    CASHBOX_AVAILABLE.store(available, Ordering::SeqCst);
+    last
+}
+
+pub(crate) fn resetting() -> bool {
+    reset_time() != 0
+}
+
+pub(crate) fn reset_time() -> u64 {
+    RESET_TIME.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_reset_time(time: u64) -> u64 {
+    let last = reset_time();
+    RESET_TIME.store(time, Ordering::SeqCst);
+    last
+}
+
+pub(crate) fn protocol_version() -> ssp::ProtocolVersion {
+    PROTOCOL_VERSION.load(Ordering::Relaxed).into()
+}
+
+pub(crate) fn set_protocol_version(protocol: ssp::ProtocolVersion) -> ssp::ProtocolVersion {
+    let last = protocol_version();
+    PROTOCOL_VERSION.store(protocol.into(), Ordering::SeqCst);
+    last
+}
+
+pub(crate) fn interactive() -> bool {
+    INTERACTIVE.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_interactive(val: bool) -> bool {
+    let last = interactive();
+    INTERACTIVE.store(val, Ordering::SeqCst);
+    last
+}
+
+/// Polling interactivity mode.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PollMode {
+    /// Automically handle polling events.
+    Auto,
+    /// Interactively handle polling events.
+    Interactive,
+}
+
+/// Receiver end of the device-sent event queue.
+///
+/// Owner of the receiver can regularly attempt to pop events from the queue,
+/// and decide how to handle an returned event(s).
+///
+/// Example:
+///
+/// ```rust, no_run
+/// # use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+/// # fn main() -> ssp::Result<()> {
+/// let stop_polling = Arc::new(AtomicBool::new(false));
+/// let poll_mode = ssp_server::PollMode::Interactive;
+///
+/// let mut handle = ssp_server::DeviceHandle::new("/dev/ttyUSB0")?;
+///
+/// let rx: ssp_server::PushEventReceiver = handle.start_background_polling_with_queue(
+///     Arc::clone(&stop_polling),
+///     poll_mode,
+/// )?;
+///
+/// // Pop events from the queue
+/// loop {
+///     while let Ok(event) = rx.pop_event() {
+///         log::debug!("Received an event: {event}");
+///         // do stuff in response to the event...
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub struct PushEventReceiver(pub mpsc::Receiver<ssp::Event>);
+
+impl PushEventReceiver {
+    /// Creates a new [PushEventReceiver] from the provided `queue`.
+    pub fn new(queue: mpsc::Receiver<ssp::Event>) -> Self {
+        Self(queue)
+    }
+
+    /// Attempt to pop an event from the queue.
+    ///
+    /// Returns `Err(_)` if an event could not be retrieved before the timeout.
+    pub fn pop_event(&self) -> Result<ssp::Event> {
+        let now = time::Instant::now();
+        let queue = &self.0;
+
+        while now.elapsed().as_millis() < QUEUE_TIMEOUT_MS {
+            if let Ok(evt) = queue.try_recv() {
+                return Ok(evt);
             }
         }
-    }};
+
+        Err(ssp::Error::QueueTimeout)
+    }
 }
 
+/// Handle for communicating with a SSP-enabled device over serial.
+///
+/// ```no_run
+/// let _handle = ssp_server::DeviceHandle::new("/dev/ttyUSB0").unwrap();
+/// ```
 pub struct DeviceHandle {
     serial_port: Arc<Mutex<TTYPort>>,
     generator: ssp::GeneratorKey,
@@ -128,9 +267,23 @@ impl DeviceHandle {
     /// - `stop_polling`: used to control when the polling routine should stop sending polling messages.
     ///
     /// If background polling has already started, the function just returns.
+    ///
+    /// Example:
+    ///
+    /// ```rust, no_run
+    /// # use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    /// # fn main() -> ssp::Result<()> {
+    /// let stop_polling = Arc::new(AtomicBool::new(false));
+    ///
+    /// let handle = ssp_server::DeviceHandle::new("/dev/ttyUSB0")?;
+    ///
+    /// handle.start_background_polling(Arc::clone(&stop_polling))?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn start_background_polling(&self, stop_polling: Arc<AtomicBool>) -> Result<()> {
         if polling_inited() {
-            Ok(())
+            Err(ssp::Error::PollingReinit)
         } else {
             // Set the global flag to disallow multiple background polling threads.
             set_polling_inited(true);
@@ -144,6 +297,10 @@ impl DeviceHandle {
 
                 while !end_polling.load(Ordering::Relaxed) {
                     if now.elapsed().as_millis() % MIN_POLLING_MS as u128 == 0 {
+                        if resetting() {
+                            continue;
+                        }
+
                         let mut locked_port = continue_on_err!(
                             Self::lock_serial_port(&serial_port),
                             "Failed to lock serial port in background polling routine"
@@ -155,39 +312,30 @@ impl DeviceHandle {
 
                         let mut message = ssp::PollCommand::new();
 
-                        if let Some(key) = key.as_ref() {
-                            match Self::poll_encrypted_message(&mut locked_port, &mut message, key)
-                            {
-                                Ok(response) => {
-                                    let poll_res = continue_on_err!(response.into_poll_response(), "Failed to convert to poll response in background polling routine");
-                                    let last_statuses = poll_res.last_response_statuses();
-
-                                    log::debug!("Successful encrypted poll command, last statuses: {last_statuses}");
-                                }
-                                Err(err) => {
-                                    log::warn!("Failed encrypted poll command: {err}");
-                                }
-                            }
+                        let res = if let Some(key) = key.as_ref() {
+                            continue_on_err!(
+                                Self::poll_encrypted_message(&mut locked_port, &mut message, key),
+                                "Failed poll command in background polling routine"
+                            )
                         } else {
-                            let res = continue_on_err!(
+                            continue_on_err!(
                                 Self::poll_message_variant(&mut locked_port, &mut message),
                                 "Failed poll command in background polling routine"
+                            )
+                        };
+
+                        let status = res.as_response().response_status();
+
+                        if status.is_ok() {
+                            let poll_res = continue_on_err!(
+                                res.into_poll_response(),
+                                "Failed to convert poll response in background polling routine"
                             );
-                            let status = res.as_response().response_status();
+                            let last_statuses = poll_res.last_response_statuses();
 
-                            if status.is_ok() {
-                                let poll_res = continue_on_err!(
-                                    res.into_poll_response(),
-                                    "Failed to convert poll response in background polling routine"
-                                );
-                                let last_statuses = poll_res.last_response_statuses();
-
-                                log::debug!(
-                                    "Successful poll command, last statuses: {last_statuses}"
-                                );
-                            } else {
-                                log::warn!("Failed poll command, response status: {status}");
-                            }
+                            log::debug!("Successful poll command, last statuses: {last_statuses}");
+                        } else {
+                            log::warn!("Failed poll command, response status: {status}");
                         }
                     }
                 }
@@ -203,6 +351,385 @@ impl DeviceHandle {
         }
     }
 
+    /// Starts background polling routine to regularly send [PollCommand] messages to the device,
+    /// with an additional event queue for sending push events from the device to the host.
+    ///
+    /// **Args**
+    ///
+    /// - `stop_polling`: used to control when the polling routine should stop sending polling messages.
+    ///
+    /// If background polling has already started, the function just returns.
+    ///
+    /// Returns an event queue receiver that the caller can use to receive device-sent events.
+    ///
+    /// Example:
+    ///
+    /// ```rust, no_run
+    /// # use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    /// # fn main() -> ssp::Result<()> {
+    /// let stop_polling = Arc::new(AtomicBool::new(false));
+    /// let poll_mode = ssp_server::PollMode::Interactive;
+    ///
+    /// let handle = ssp_server::DeviceHandle::new("/dev/ttyUSB0")?;
+    ///
+    /// let rx = handle.start_background_polling_with_queue(
+    ///     Arc::clone(&stop_polling),
+    ///     poll_mode,
+    /// )?;
+    ///
+    /// // Pop events from the queue
+    /// loop {
+    ///     while let Ok(event) = rx.pop_event() {
+    ///         log::debug!("Received an event: {event}");
+    ///         // do stuff in response to the event...
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn start_background_polling_with_queue(
+        &self,
+        stop_polling: Arc<AtomicBool>,
+        poll_mode: PollMode,
+    ) -> Result<PushEventReceiver> {
+        if polling_inited() {
+            Err(ssp::Error::PollingReinit)
+        } else {
+            // Set the global flag to disallow multiple background polling threads.
+            set_polling_inited(true);
+
+            if poll_mode == PollMode::Interactive {
+                set_interactive(true);
+            }
+
+            let serial_port = Arc::clone(&self.serial_port);
+            let end_polling = Arc::clone(&stop_polling);
+            let key = Arc::clone(&self.key);
+
+            let (tx, rx) = mpsc::channel();
+
+            thread::spawn(move || -> Result<()> {
+                let now = time::Instant::now();
+
+                while !end_polling.load(Ordering::Relaxed) {
+                    if now.elapsed().as_millis() % MIN_POLLING_MS as u128 == 0 {
+                        if resetting() {
+                            continue;
+                        }
+
+                        let mut locked_port = continue_on_err!(
+                            Self::lock_serial_port(&serial_port),
+                            "Failed to lock serial port in background polling routine"
+                        );
+
+                        let key = continue_on_err!(
+                            Self::lock_encryption_key(&key),
+                            "Failed to lock encryption key in background polling routine"
+                        );
+
+                        if escrowed() && poll_mode == PollMode::Interactive {
+                            // Do not automatically poll when device has a bill in escrow,
+                            // and the user is in interactive mode.
+                            //
+                            // Sending a poll with bill in escrow stacks the bill.
+                            //
+                            // Sit in a busy loop until the user sends a stack/reject command.
+
+                            // Send hold command to keep note in escrow until `stack` or `reject`
+                            // is sent.
+                            let mut message = ssp::HoldCommand::new();
+
+                            continue_on_err!(
+                                Self::poll_message(&mut locked_port, &mut message, key.as_ref()),
+                                "Failed hold command"
+                            );
+
+                            continue;
+                        }
+
+                        let mut message = ssp::PollCommand::new();
+
+                        let res = continue_on_err!(
+                            Self::poll_message(&mut locked_port, &mut message, key.as_ref()),
+                            "Failed poll command"
+                        );
+
+                        let status = res.as_response().response_status();
+                        if status.is_ok() {
+                            let poll_res = continue_on_err!(
+                                res.into_poll_response(),
+                                "Failed to convert poll response in background polling routine"
+                            );
+
+                            Self::parse_events(&poll_res, &tx)?;
+                        } else {
+                            log::warn!("Failed poll command, response status: {status}");
+                        }
+                    }
+                }
+
+                // Now that polling finished, reset the flag to allow another background routine to
+                // start.
+                set_polling_inited(false);
+
+                Ok(())
+            });
+
+            Ok(PushEventReceiver::new(rx))
+        }
+    }
+
+    fn poll_resetting(
+        serial_port: &mut TTYPort,
+        key: Option<&ssp::AesKey>,
+        tx: Option<&mpsc::Sender<ssp::Event>>,
+    ) -> Result<()> {
+        use std::ops::Sub;
+
+        let reset_time = time::Instant::now().sub(time::Duration::from_secs(reset_time()));
+        let mut message = ssp::PollCommand::new();
+
+        while (1..RESET_TIMEOUT_SECS).contains(&reset_time.elapsed().as_secs()) {
+            let elapsed = reset_time.elapsed().as_secs();
+            let res = continue_on_err!(
+                Self::poll_message(serial_port, &mut message, key),
+                format!("Device is still resetting, elapsed time: {elapsed}")
+            );
+            if res.as_response().response_status().is_ok() {
+                set_reset_time(0);
+
+                if let Some(tx) = tx {
+                    continue_on_err!(
+                        tx.send(ssp::Event::from(ssp::ResetEvent::new())),
+                        "Failed to send Reset event"
+                    );
+                }
+
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "jsonrpc")]
+    pub fn on_message(&mut self, stream: &mut UnixStream) -> Result<ssp::Method> {
+        stream.set_nonblocking(true)?;
+
+        let mut message_buf = vec![0u8; 1024];
+        let mut idx = 0;
+
+        while let Ok(ret) = stream.read(&mut message_buf) {
+            if ret == 0 {
+                // Client hung up the socket, so let the caller know to shutdown the stream
+                return Ok(ssp::Method::Shutdown);
+            }
+
+            if idx >= message_buf.len() {
+                message_buf.resize(2 * message_buf.len(), 0u8);
+            }
+
+            idx += ret;
+
+            if message_buf.contains(&b'\n') {
+                break;
+            }
+        }
+
+        let message_string = std::str::from_utf8(message_buf[..idx].as_ref()).unwrap_or("");
+        if message_string.is_empty() || message_string.contains("ready") {
+            return Ok(ssp::Method::Enable);
+        }
+
+        for message in message_string.split('\n') {
+            if !message.is_empty() {
+                log::debug!("Received message: {message}");
+
+                let message = match serde_json::from_str::<Request>(message) {
+                    Ok(msg) => msg,
+                    Err(err) => {
+                        log::warn!("Expected valid JSON-RPC request, error: {err}");
+                        continue;
+                    }
+                };
+
+                let event = ssp::Event::from(&message);
+                let method = event.method();
+                log::debug!("Message method: {method}");
+
+                let jsonrpc_id = message.id().unwrap_or(jsonrpc_id());
+                set_jsonrpc_id(jsonrpc_id);
+
+                match method {
+                    ssp::Method::Disable => self.on_disable(stream, &event)?,
+                    ssp::Method::Enable => self.on_enable(stream, &event)?,
+                    ssp::Method::Reject => self.on_reject(stream, &event)?,
+                    ssp::Method::Stack => self.on_stack(stream, &event)?,
+                    ssp::Method::StackerFull => self.on_stacker_full(stream, &event)?,
+                    ssp::Method::Status => self.on_status(stream, &event)?,
+                    ssp::Method::Reset => self.on_reset(stream, &event)?,
+                    _ => return Err(ssp::Error::JsonRpc("unsupported method".into())),
+                }
+
+                return Ok(method);
+            }
+        }
+
+        Ok(ssp::Method::Disable)
+    }
+
+    #[cfg(feature = "jsonrpc")]
+    fn on_disable(&self, stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
+        self.disable()?;
+
+        let mut res = Response::from(ssp::Event::from(ssp::DisableEvent::new()));
+        res.set_id(jsonrpc_id());
+
+        let mut res_str = serde_json::to_string(&res)?;
+        res_str += "\n";
+
+        stream.write_all(res_str.as_bytes())?;
+
+        Ok(())
+    }
+
+    #[cfg(feature = "jsonrpc")]
+    fn on_enable(&self, stream: &mut UnixStream, event: &ssp::Event) -> Result<()> {
+        // perform full init sequence,
+        // only sending EnableCommand does not bring the device online...
+        let enable_event = ssp::EnableEvent::try_from(event)?;
+        self.enable_device(enable_event.protocol_version())?;
+
+        let mut res = Response::from(ssp::Event::from(enable_event));
+        res.set_id(jsonrpc_id());
+
+        let mut res_str = serde_json::to_string(&res)?;
+        res_str += "\n";
+
+        stream.write_all(res_str.as_bytes())?;
+
+        Ok(())
+    }
+
+    #[cfg(feature = "jsonrpc")]
+    fn on_reject(&self, stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
+        self.reject()?;
+
+        let mut res = Response::from(ssp::Event::from(ssp::RejectEvent::new()));
+        res.set_id(jsonrpc_id());
+
+        let mut res_str = serde_json::to_string(&res)?;
+        res_str += "\n";
+
+        stream.write_all(res_str.as_bytes())?;
+
+        Ok(())
+    }
+
+    #[cfg(feature = "jsonrpc")]
+    fn on_stack(&self, stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
+        let value = self.stack()?;
+
+        let mut res = Response::from(ssp::Event::from(ssp::StackEvent::from(value)));
+        res.set_id(jsonrpc_id());
+
+        let mut res_str = serde_json::to_string(&res)?;
+        res_str += "\n";
+
+        stream.write_all(res_str.as_bytes())?;
+
+        Ok(())
+    }
+
+    #[cfg(feature = "jsonrpc")]
+    fn on_stacker_full(&self, _stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
+        Err(ssp::Error::JsonRpc(
+            "StackerFull handler unimplemented".into(),
+        ))
+    }
+
+    #[cfg(feature = "jsonrpc")]
+    fn on_status(&self, stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
+        let data = self.unit_data()?;
+        let status = ssp::DeviceStatus::from(data);
+
+        let mut res = Response::from(ssp::Event::from(ssp::StatusEvent::new(status)));
+        res.set_id(jsonrpc_id());
+
+        let mut res_str = serde_json::to_string(&res)?;
+        res_str += "\n";
+
+        stream.write_all(res_str.as_bytes())?;
+
+        Ok(())
+    }
+
+    // FIXME: the server needs to restart after the device is reset, then everything works as
+    // normal.
+    //
+    // Otherwise, the server will be stuck, or receive garbage data from the device.
+    //
+    // Unsure how to fix this, since the SSP docs have contradicting instructions for the Sync
+    // command (the Implementation Guide says it resets the Sequence Flag to one, the Protocol
+    // Guide says it resets to zero...
+    //
+    // Regardless, neither value works, and the only thing that works is a server reset...
+    #[cfg(feature = "jsonrpc")]
+    fn on_reset(&self, stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
+        self.reset()?;
+
+        let now = time::Instant::now();
+
+        // Wait a bit for the device to reset, and re-open the port.
+        thread::sleep(time::Duration::from_secs(20));
+
+        let mut serial_port = self.serial_port()?;
+
+        while now.elapsed().as_secs() < RESET_TIMEOUT_SECS {
+            if let Ok(res) = self.sync_inner(&mut serial_port) {
+                if res.response_status().is_ok() {
+                    set_reset_time(0);
+
+                    let poll_res = self.poll_inner(&mut serial_port)?;
+                    if poll_res.response_status().is_ok() {
+                        let mut res = Response::from(ssp::Event::from(ssp::ResetEvent::new()));
+                        res.set_id(jsonrpc_id());
+
+                        let mut res_str = serde_json::to_string(&res)?;
+                        res_str += "\n";
+
+                        log::debug!("Successfully reset device: {res_str}");
+
+                        stream.write_all(res_str.as_bytes())?;
+
+                        if let Err(err) =
+                            self.enable_device_inner(&mut serial_port, protocol_version())
+                        {
+                            log::error!("Error enabling device after reset: {err}");
+                        }
+
+                        if interactive() {
+                            // if the server is running in interactive mode, disable until the client
+                            // re-enables the device.
+                            if let Err(err) = self.disable_inner(&mut serial_port) {
+                                log::error!("Error disabling device after reset: {err}");
+                            }
+                        }
+
+                        return Ok(());
+                    } else {
+                        return Err(ssp::Error::InvalidStatus((
+                            poll_res.response_status(),
+                            ssp::ResponseStatus::Ok,
+                        )));
+                    }
+                }
+            }
+        }
+
+        Err(ssp::Error::JsonRpc("failed to reset device".into()))
+    }
+
     /// Get the serial port used for communication with the acceptor device
     pub fn serial_port(&self) -> Result<MutexGuard<'_, TTYPort>> {
         Self::lock_serial_port(&self.serial_port)
@@ -213,9 +740,9 @@ impl DeviceHandle {
     ) -> Result<MutexGuard<'_, TTYPort>> {
         serial_port
             .try_lock_for(time::Duration::from_millis(LOCK_TIMEOUT_MS))
-            .ok_or(ssp::Error::SerialPort(serialport::ErrorKind::Io(
-                std::io::ErrorKind::TimedOut,
-            )))
+            .ok_or(ssp::Error::SerialPort(
+                "timed out locking serial port".into(),
+            ))
     }
 
     /// Acquires a lock on the AES encryption key.
@@ -227,7 +754,7 @@ impl DeviceHandle {
         key: &Arc<Mutex<Option<ssp::AesKey>>>,
     ) -> Result<MutexGuard<'_, Option<ssp::AesKey>>> {
         key.try_lock_for(time::Duration::from_millis(LOCK_TIMEOUT_MS))
-            .ok_or(ssp::Error::Io(std::io::ErrorKind::TimedOut))
+            .ok_or(ssp::Error::Io("timed out locking encryption key".into()))
     }
 
     /// Creates a new [GeneratorKey](ssp::GeneratorKey) from system entropy.
@@ -292,6 +819,22 @@ impl DeviceHandle {
         }
     }
 
+    /// Sends a command to stack a bill in escrow.
+    pub fn stack(&self) -> Result<ssp::ChannelValue> {
+        let mut serial_port = self.serial_port()?;
+
+        let mut message = ssp::PollCommand::new();
+        let res = Self::poll_message(&mut serial_port, &mut message, encryption_key!(self))?;
+
+        let status = res.as_response().response_status();
+        if status.is_ok() {
+            set_escrowed(false);
+            Ok(set_escrowed_amount(ssp::ChannelValue::default()))
+        } else {
+            Err(ssp::Error::InvalidStatus((status, ssp::ResponseStatus::Ok)))
+        }
+    }
+
     /// Send a [SetInhibitsCommand](ssp::SetInhibitsCommand) message to the device.
     ///
     /// No response is returned.
@@ -299,15 +842,22 @@ impl DeviceHandle {
     /// The caller should wait a reasonable amount of time for the device
     /// to come back online before sending additional messages.
     pub fn set_inhibits(
-        &mut self,
+        &self,
         enable_list: ssp::EnableBitfieldList,
     ) -> Result<ssp::SetInhibitsResponse> {
         let mut serial_port = self.serial_port()?;
+        self.set_inhibits_inner(&mut serial_port, enable_list)
+    }
 
+    fn set_inhibits_inner(
+        &self,
+        serial_port: &mut TTYPort,
+        enable_list: ssp::EnableBitfieldList,
+    ) -> Result<ssp::SetInhibitsResponse> {
         let mut message = ssp::SetInhibitsCommand::new();
         message.set_inhibits(enable_list)?;
 
-        let res = Self::poll_message(&mut serial_port, &mut message, encryption_key!(self))?;
+        let res = Self::poll_message(serial_port, &mut message, encryption_key!(self))?;
 
         res.into_set_inhibits_response()
     }
@@ -318,7 +868,7 @@ impl DeviceHandle {
     ///
     /// The caller should wait a reasonable amount of time for the device
     /// to come back online before sending additional messages.
-    pub fn reset(&mut self) -> Result<()> {
+    pub fn reset(&self) -> Result<()> {
         let mut serial_port = self.serial_port()?;
 
         let mut message = ssp::ResetCommand::new();
@@ -327,24 +877,34 @@ impl DeviceHandle {
 
         serial_port.write_all(message.as_bytes())?;
 
+        set_reset_time(
+            time::SystemTime::now()
+                .duration_since(time::UNIX_EPOCH)?
+                .as_secs(),
+        );
+
         Ok(())
     }
 
     /// Send a [PollCommand](ssp::PollCommand) message to the device.
-    pub fn poll(&mut self) -> Result<ssp::PollResponse> {
+    pub fn poll(&self) -> Result<ssp::PollResponse> {
         let mut serial_port = self.serial_port()?;
 
+        self.poll_inner(&mut serial_port)
+    }
+
+    fn poll_inner(&self, serial_port: &mut TTYPort) -> Result<ssp::PollResponse> {
         let mut message = ssp::PollCommand::new();
 
         Self::set_message_sequence_flag(&mut message);
 
-        let response = Self::poll_message(&mut serial_port, &mut message, encryption_key!(self))?;
+        let response = Self::poll_message(serial_port, &mut message, encryption_key!(self))?;
 
         response.into_poll_response()
     }
 
     /// Send a [PollWithAckCommand](ssp::PollWithAckCommand) message to the device.
-    pub fn poll_with_ack(&mut self) -> Result<ssp::PollWithAckResponse> {
+    pub fn poll_with_ack(&self) -> Result<ssp::PollWithAckResponse> {
         let mut serial_port = self.serial_port()?;
 
         let mut message = ssp::PollWithAckCommand::new();
@@ -357,7 +917,7 @@ impl DeviceHandle {
     }
 
     /// Send a [EventAckCommand](ssp::EventAckCommand) message to the device.
-    pub fn event_ack(&mut self) -> Result<ssp::EventAckResponse> {
+    pub fn event_ack(&self) -> Result<ssp::EventAckResponse> {
         let mut serial_port = self.serial_port()?;
 
         let mut message = ssp::EventAckCommand::new();
@@ -370,7 +930,7 @@ impl DeviceHandle {
     }
 
     /// Send a [RejectCommand](ssp::RejectCommand) message to the device.
-    pub fn reject(&mut self) -> Result<ssp::RejectResponse> {
+    pub fn reject(&self) -> Result<ssp::RejectResponse> {
         let mut serial_port = self.serial_port()?;
 
         let mut message = ssp::RejectCommand::new();
@@ -379,49 +939,105 @@ impl DeviceHandle {
 
         let response = Self::poll_message(&mut serial_port, &mut message, encryption_key!(self))?;
 
-        response.into_reject_response()
+        let res = response.into_reject_response()?;
+
+        let status = res.response_status();
+
+        if status.is_ok() {
+            set_escrowed(false);
+            set_escrowed_amount(ssp::ChannelValue::default());
+
+            Ok(res)
+        } else {
+            Err(ssp::Error::InvalidStatus((status, ssp::ResponseStatus::Ok)))
+        }
     }
 
     /// Send a [SyncCommand](ssp::SyncCommand) message to the device.
-    pub fn sync(&mut self) -> Result<ssp::SyncResponse> {
+    pub fn sync(&self) -> Result<ssp::SyncResponse> {
         let mut serial_port = self.serial_port()?;
 
+        self.sync_inner(&mut serial_port)
+    }
+
+    fn sync_inner(&self, serial_port: &mut TTYPort) -> Result<ssp::SyncResponse> {
         let mut message = ssp::SyncCommand::new();
 
-        let response = Self::poll_message(&mut serial_port, &mut message, encryption_key!(self))?;
+        let response = Self::poll_message(serial_port, &mut message, encryption_key!(self))?;
 
-        // Ensure the next sequence flag sent is set.
-        // FIXME: regardless of the setting, Sync messages appear to cause problems with following
-        // messages. Need more hardware to troubleshoot.
-        set_sequence_flag(ssp::SequenceFlag::Set);
+        set_sequence_flag(ssp::SequenceFlag::from(0));
 
         response.into_sync_response()
     }
 
-    /// Send a [EnableCommand](ssp::EnableCommand) message to the device.
-    pub fn enable(&mut self) -> Result<ssp::EnableResponse> {
+    /// Starts the device by performing the full initialization sequence.
+    pub fn enable_device(
+        &self,
+        protocol_version: ssp::ProtocolVersion,
+    ) -> Result<ssp::EnableResponse> {
         let mut serial_port = self.serial_port()?;
 
+        self.enable_device_inner(&mut serial_port, protocol_version)
+    }
+
+    fn enable_device_inner(
+        &self,
+        serial_port: &mut TTYPort,
+        protocol_version: ssp::ProtocolVersion,
+    ) -> Result<ssp::EnableResponse> {
+        self.poll_inner(serial_port)?;
+
+        let status_res = self.unit_data_inner(serial_port)?;
+        self.serial_number_inner(serial_port)?;
+
+        if status_res.protocol_version() != protocol_version {
+            self.host_protocol_version_inner(serial_port, protocol_version)?;
+            set_protocol_version(protocol_version);
+        }
+
+        let enable_list = ssp::EnableBitfieldList::from([
+            ssp::EnableBitfield::from(0xff),
+            ssp::EnableBitfield::from(0xff),
+            #[cfg(feature = "nv200")]
+            ssp::EnableBitfield::from(0xff),
+        ]);
+
+        self.set_inhibits_inner(serial_port, enable_list)?;
+        self.channel_value_data_inner(serial_port)?;
+
+        self.enable_inner(serial_port)
+    }
+
+    /// Send a [EnableCommand](ssp::EnableCommand) message to the device.
+    pub fn enable(&self) -> Result<ssp::EnableResponse> {
+        let mut serial_port = self.serial_port()?;
+        self.enable_inner(&mut serial_port)
+    }
+
+    fn enable_inner(&self, serial_port: &mut TTYPort) -> Result<ssp::EnableResponse> {
         let mut message = ssp::EnableCommand::new();
 
-        let response = Self::poll_message(&mut serial_port, &mut message, encryption_key!(self))?;
+        let response = Self::poll_message(serial_port, &mut message, encryption_key!(self))?;
 
         response.into_enable_response()
     }
 
     /// Send a [DisableCommand](ssp::DisableCommand) message to the device.
-    pub fn disable(&mut self) -> Result<ssp::DisableResponse> {
+    pub fn disable(&self) -> Result<ssp::DisableResponse> {
         let mut serial_port = self.serial_port()?;
+        self.disable_inner(&mut serial_port)
+    }
 
+    fn disable_inner(&self, serial_port: &mut TTYPort) -> Result<ssp::DisableResponse> {
         let mut message = ssp::DisableCommand::new();
 
-        let response = Self::poll_message(&mut serial_port, &mut message, encryption_key!(self))?;
+        let response = Self::poll_message(serial_port, &mut message, encryption_key!(self))?;
 
         response.into_disable_response()
     }
 
     /// Send a [DisplayOffCommand](ssp::DisplayOffCommand) message to the device.
-    pub fn display_off(&mut self) -> Result<ssp::DisplayOffResponse> {
+    pub fn display_off(&self) -> Result<ssp::DisplayOffResponse> {
         let mut serial_port = self.serial_port()?;
 
         let mut message = ssp::DisplayOffCommand::new();
@@ -432,7 +1048,7 @@ impl DeviceHandle {
     }
 
     /// Send a [DisplayOnCommand](ssp::DisplayOnCommand) message to the device.
-    pub fn display_on(&mut self) -> Result<ssp::DisplayOnResponse> {
+    pub fn display_on(&self) -> Result<ssp::DisplayOnResponse> {
         let mut serial_port = self.serial_port()?;
 
         let mut message = ssp::DisplayOnCommand::new();
@@ -443,7 +1059,7 @@ impl DeviceHandle {
     }
 
     /// Send an [EmptyCommand](ssp::EmptyCommand) message to the device.
-    pub fn empty(&mut self) -> Result<ssp::EmptyResponse> {
+    pub fn empty(&self) -> Result<ssp::EmptyResponse> {
         let mut serial_port = self.serial_port()?;
 
         let mut message = ssp::EmptyCommand::new();
@@ -458,7 +1074,7 @@ impl DeviceHandle {
     }
 
     /// Send an [SmartEmptyCommand](ssp::SmartEmptyCommand) message to the device.
-    pub fn smart_empty(&mut self) -> Result<ssp::SmartEmptyResponse> {
+    pub fn smart_empty(&self) -> Result<ssp::SmartEmptyResponse> {
         let mut serial_port = self.serial_port()?;
 
         let mut message = ssp::SmartEmptyCommand::new();
@@ -474,26 +1090,37 @@ impl DeviceHandle {
 
     /// Send an [HostProtocolVersionCommand](ssp::HostProtocolVersionCommand) message to the device.
     pub fn host_protocol_version(
-        &mut self,
+        &self,
         protocol_version: ssp::ProtocolVersion,
     ) -> Result<ssp::HostProtocolVersionResponse> {
         let mut serial_port = self.serial_port()?;
 
+        self.host_protocol_version_inner(&mut serial_port, protocol_version)
+    }
+
+    fn host_protocol_version_inner(
+        &self,
+        serial_port: &mut TTYPort,
+        protocol_version: ssp::ProtocolVersion,
+    ) -> Result<ssp::HostProtocolVersionResponse> {
         let mut message = ssp::HostProtocolVersionCommand::new();
         message.set_version(protocol_version);
 
-        let response = Self::poll_message(&mut serial_port, &mut message, encryption_key!(self))?;
+        let response = Self::poll_message(serial_port, &mut message, encryption_key!(self))?;
 
         response.into_host_protocol_version_response()
     }
 
     /// Send a [SerialNumberCommand](ssp::SerialNumberCommand) message to the device.
-    pub fn serial_number(&mut self) -> Result<ssp::SerialNumberResponse> {
+    pub fn serial_number(&self) -> Result<ssp::SerialNumberResponse> {
         let mut serial_port = self.serial_port()?;
+        self.serial_number_inner(&mut serial_port)
+    }
 
+    fn serial_number_inner(&self, serial_port: &mut TTYPort) -> Result<ssp::SerialNumberResponse> {
         let mut message = ssp::SerialNumberCommand::new();
 
-        let res = Self::poll_message(&mut serial_port, &mut message, encryption_key!(self))?;
+        let res = Self::poll_message(serial_port, &mut message, encryption_key!(self))?;
 
         res.into_serial_number_response()
     }
@@ -503,7 +1130,7 @@ impl DeviceHandle {
     /// If the response is an `Err(_)`, or the response status is not
     /// [RsponseStatus::Ok](ssp::ResponseStatus::Ok), the caller should call
     /// [new_generator_key](Self::new_generator_key), and try again.
-    pub fn set_generator(&mut self) -> Result<ssp::SetGeneratorResponse> {
+    pub fn set_generator(&self) -> Result<ssp::SetGeneratorResponse> {
         let mut serial_port = self.serial_port()?;
 
         let mut message = ssp::SetGeneratorCommand::new();
@@ -608,40 +1235,68 @@ impl DeviceHandle {
     }
 
     /// Send a [SetupRequestCommand](ssp::SetupRequestCommand) message to the device.
-    pub fn setup_request(&mut self) -> Result<ssp::SetupRequestResponse> {
+    pub fn setup_request(&self) -> Result<ssp::SetupRequestResponse> {
         let mut serial_port = self.serial_port()?;
+        self.setup_request_inner(&mut serial_port)
+    }
 
+    fn setup_request_inner(&self, serial_port: &mut TTYPort) -> Result<ssp::SetupRequestResponse> {
         let mut message = ssp::SetupRequestCommand::new();
 
-        let response = Self::poll_message(&mut serial_port, &mut message, encryption_key!(self))?;
+        let response = Self::poll_message(serial_port, &mut message, encryption_key!(self))?;
 
-        response.into_setup_request_response()
+        let res = response.into_setup_request_response()?;
+
+        // configure global channel values
+        let chan_vals = match res.protocol_version()? as u8 {
+            0..=5 | 0xff => res.channel_values()?,
+            _ => res.channel_values_long()?,
+        };
+
+        ssp::configure_channels(chan_vals.as_ref())?;
+
+        Ok(res)
     }
 
     /// Send a [UnitDataCommand](ssp::UnitDataCommand) message to the device.
-    pub fn unit_data(&mut self) -> Result<ssp::UnitDataResponse> {
+    pub fn unit_data(&self) -> Result<ssp::UnitDataResponse> {
         let mut serial_port = self.serial_port()?;
 
+        self.unit_data_inner(&mut serial_port)
+    }
+
+    fn unit_data_inner(&self, serial_port: &mut TTYPort) -> Result<ssp::UnitDataResponse> {
         let mut message = ssp::UnitDataCommand::new();
 
-        let response = Self::poll_message(&mut serial_port, &mut message, encryption_key!(self))?;
+        let response = Self::poll_message(serial_port, &mut message, encryption_key!(self))?;
 
         response.into_unit_data_response()
     }
 
     /// Send a [ChannelValueDataCommand](ssp::ChannelValueDataCommand) message to the device.
-    pub fn channel_value_data(&mut self) -> Result<ssp::ChannelValueDataResponse> {
+    pub fn channel_value_data(&self) -> Result<ssp::ChannelValueDataResponse> {
         let mut serial_port = self.serial_port()?;
 
+        self.channel_value_data_inner(&mut serial_port)
+    }
+
+    fn channel_value_data_inner(
+        &self,
+        serial_port: &mut TTYPort,
+    ) -> Result<ssp::ChannelValueDataResponse> {
         let mut message = ssp::ChannelValueDataCommand::new();
 
-        let response = Self::poll_message(&mut serial_port, &mut message, encryption_key!(self))?;
+        let response = Self::poll_message(serial_port, &mut message, encryption_key!(self))?;
 
-        response.into_channel_value_data_response()
+        let res = response.into_channel_value_data_response()?;
+
+        ssp::configure_channels(res.channel_values()?.as_ref())?;
+
+        Ok(res)
     }
 
     /// Send a [LastRejectCodeCommand](ssp::LastRejectCodeCommand) message to the device.
-    pub fn last_reject_code(&mut self) -> Result<ssp::LastRejectCodeResponse> {
+    pub fn last_reject_code(&self) -> Result<ssp::LastRejectCodeResponse> {
         let mut serial_port = self.serial_port()?;
 
         let mut message = ssp::LastRejectCodeCommand::new();
@@ -652,7 +1307,7 @@ impl DeviceHandle {
     }
 
     /// Send a [HoldCommand](ssp::HoldCommand) message to the device.
-    pub fn hold(&mut self) -> Result<ssp::HoldResponse> {
+    pub fn hold(&self) -> Result<ssp::HoldResponse> {
         let mut serial_port = self.serial_port()?;
 
         let mut message = ssp::HoldCommand::new();
@@ -664,7 +1319,7 @@ impl DeviceHandle {
 
     /// Send a [GetBarcodeReaderConfigurationCommand](ssp::GetBarcodeReaderConfigurationCommand) message to the device.
     pub fn get_barcode_reader_configuration(
-        &mut self,
+        &self,
     ) -> Result<ssp::GetBarcodeReaderConfigurationResponse> {
         let mut serial_port = self.serial_port()?;
 
@@ -676,7 +1331,7 @@ impl DeviceHandle {
     }
 
     /// Gets whether the device has barcode readers present.
-    pub fn has_barcode_reader(&mut self) -> Result<bool> {
+    pub fn has_barcode_reader(&self) -> Result<bool> {
         let mut serial_port = self.serial_port()?;
 
         let mut message = ssp::GetBarcodeReaderConfigurationCommand::new();
@@ -691,7 +1346,7 @@ impl DeviceHandle {
 
     /// Send a [SetBarcodeReaderConfigurationCommand](ssp::SetBarcodeReaderConfigurationCommand) message to the device.
     pub fn set_barcode_reader_configuration(
-        &mut self,
+        &self,
         config: ssp::BarcodeConfiguration,
     ) -> Result<ssp::SetBarcodeReaderConfigurationResponse> {
         let mut serial_port = self.serial_port()?;
@@ -705,7 +1360,7 @@ impl DeviceHandle {
     }
 
     /// Send a [GetBarcodeInhibitCommand](ssp::GetBarcodeInhibitCommand) message to the device.
-    pub fn get_barcode_inhibit(&mut self) -> Result<ssp::GetBarcodeInhibitResponse> {
+    pub fn get_barcode_inhibit(&self) -> Result<ssp::GetBarcodeInhibitResponse> {
         let mut serial_port = self.serial_port()?;
 
         let mut message = ssp::GetBarcodeInhibitCommand::new();
@@ -717,7 +1372,7 @@ impl DeviceHandle {
 
     /// Send a [SetBarcodeInhibitCommand](ssp::SetBarcodeInhibitCommand) message to the device.
     pub fn set_barcode_inhibit(
-        &mut self,
+        &self,
         inhibit: ssp::BarcodeCurrencyInhibit,
     ) -> Result<ssp::SetBarcodeInhibitResponse> {
         let mut serial_port = self.serial_port()?;
@@ -731,7 +1386,7 @@ impl DeviceHandle {
     }
 
     /// Send a [GetBarcodeDataCommand](ssp::GetBarcodeDataCommand) message to the device.
-    pub fn get_barcode_data(&mut self) -> Result<ssp::GetBarcodeDataResponse> {
+    pub fn get_barcode_data(&self) -> Result<ssp::GetBarcodeDataResponse> {
         let mut serial_port = self.serial_port()?;
 
         let mut message = ssp::GetBarcodeDataCommand::new();
@@ -743,7 +1398,7 @@ impl DeviceHandle {
 
     /// Send a [ConfigureBezelCommand](ssp::ConfigureBezelCommand) message to the device.
     pub fn configure_bezel(
-        &mut self,
+        &self,
         rgb: ssp::RGB,
         storage: ssp::BezelConfigStorage,
     ) -> Result<ssp::ConfigureBezelResponse> {
@@ -828,7 +1483,7 @@ impl DeviceHandle {
         }
 
         let wrapped_res = response.into_wrapped_encrypted_message()?;
-        let dec_res = ssp::EncryptedResponse::decrypt(&key, wrapped_res);
+        let dec_res = ssp::EncryptedResponse::decrypt(key, wrapped_res);
 
         let mut res = ssp::MessageVariant::new(message.command());
         res.as_response_mut().set_data(dec_res.data())?;
