@@ -578,8 +578,11 @@ impl DeviceHandle {
         Ok(ssp::Method::Disable)
     }
 
+    /// Message handler for [Disable](ssp::Event::DisableEvent) events.
+    /// 
+    /// Exposed to help with creating a custom message handler.
     #[cfg(feature = "jsonrpc")]
-    fn on_disable(&self, stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
+    pub fn on_disable(&self, stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
         self.disable()?;
 
         let mut res = Response::from(ssp::Event::from(ssp::DisableEvent::new()));
@@ -593,8 +596,11 @@ impl DeviceHandle {
         Ok(())
     }
 
+    /// Message handler for [Enable](ssp::Event::EnableEvent) events.
+    /// 
+    /// Exposed to help with creating a custom message handler.
     #[cfg(feature = "jsonrpc")]
-    fn on_enable(&self, stream: &mut UnixStream, event: &ssp::Event) -> Result<()> {
+    pub fn on_enable(&self, stream: &mut UnixStream, event: &ssp::Event) -> Result<()> {
         // perform full init sequence,
         // only sending EnableCommand does not bring the device online...
         let enable_event = ssp::EnableEvent::try_from(event)?;
@@ -611,8 +617,11 @@ impl DeviceHandle {
         Ok(())
     }
 
+    /// Message handler for [Reject](ssp::Event::RejectEvent) events.
+    /// 
+    /// Exposed to help with creating a custom message handler.
     #[cfg(feature = "jsonrpc")]
-    fn on_reject(&self, stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
+    pub fn on_reject(&self, stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
         self.reject()?;
 
         let mut res = Response::from(ssp::Event::from(ssp::RejectEvent::new()));
@@ -626,8 +635,11 @@ impl DeviceHandle {
         Ok(())
     }
 
+    /// Message handler for [Stack](ssp::Event::StackEvent) events.
+    /// 
+    /// Exposed to help with creating a custom message handler.
     #[cfg(feature = "jsonrpc")]
-    fn on_stack(&self, stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
+    pub fn on_stack(&self, stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
         let value = self.stack()?;
 
         let mut res = Response::from(ssp::Event::from(ssp::StackEvent::from(value)));
@@ -641,19 +653,34 @@ impl DeviceHandle {
         Ok(())
     }
 
+    /// Message handler for [StackerFull](ssp::Event::StackerFullEvent) events.
+    /// 
+    /// Exposed to help with creating a custom message handler.
     #[cfg(feature = "jsonrpc")]
-    fn on_stacker_full(&self, _stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
+    pub fn on_stacker_full(&self, _stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
         Err(ssp::Error::JsonRpc(
             "StackerFull handler unimplemented".into(),
         ))
     }
 
+    /// Message handler for [Status](ssp::Event::StatusEvent) events.
+    /// 
+    /// Exposed to help with creating a custom message handler.
     #[cfg(feature = "jsonrpc")]
-    fn on_status(&self, stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
+    pub fn on_status(&self, stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
         let data = self.unit_data()?;
-        let status = ssp::DeviceStatus::from(data);
 
-        let mut res = Response::from(ssp::Event::from(ssp::StatusEvent::new(status)));
+        let cashbox_available = cashbox_available();
+        let status = ssp::DeviceStatus::from(data)
+            .with_cashbox_attached(cashbox_available);
+
+        let event = if cashbox_available {
+            ssp::StatusEvent::new(status)
+        } else {
+            ssp::StatusEvent::new(status.with_response_status(ssp::ResponseStatus::CashboxRemoved))
+        };
+
+        let mut res = Response::from(ssp::Event::from(event));
         res.set_id(jsonrpc_id());
 
         let mut res_str = serde_json::to_string(&res)?;
@@ -664,6 +691,14 @@ impl DeviceHandle {
         Ok(())
     }
 
+    /// Message handler for [Status](ssp::Event::StatusEvent) events.
+    /// 
+    /// Exposed to help with creating a custom message handler.
+    ///
+    /// **WARNING**: currently, the server requires a restart after a device reset. This seems to
+    /// be implementation specific, since the documentation describes a procedure for re-enabling
+    /// the device without a server restart. However, following the documentation procedure results
+    /// in an inoperable server... TBD.
     // FIXME: the server needs to restart after the device is reset, then everything works as
     // normal.
     //
@@ -675,7 +710,7 @@ impl DeviceHandle {
     //
     // Regardless, neither value works, and the only thing that works is a server reset...
     #[cfg(feature = "jsonrpc")]
-    fn on_reset(&self, stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
+    pub fn on_reset(&self, stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
         self.reset()?;
 
         let now = time::Instant::now();
@@ -730,7 +765,7 @@ impl DeviceHandle {
         Err(ssp::Error::JsonRpc("failed to reset device".into()))
     }
 
-    /// Get the serial port used for communication with the acceptor device
+    /// Acquires a lock on the serial port used for communication with the acceptor device.
     pub fn serial_port(&self) -> Result<MutexGuard<'_, TTYPort>> {
         Self::lock_serial_port(&self.serial_port)
     }

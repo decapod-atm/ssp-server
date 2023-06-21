@@ -74,6 +74,7 @@ impl Server {
     /// Creates a new [Server] that interactively handles device events via
     /// a client connects over Unix domain sockets.
     #[cfg(feature = "jsonrpc")]
+    #[cfg_attr(doc_cfg, doc(cfg(feature = "jsonrpc")))]
     pub fn new_uds(
         serial_path: &str,
         socket_path: &str,
@@ -271,7 +272,10 @@ impl Server {
     fn send(stream: &mut UnixStream, msg: &Event) -> Result<()> {
         log::debug!("Sending push event: {msg}");
 
-        let push_req = smol_jsonrpc::Request::new().with_params(msg);
+        let push_req = smol_jsonrpc::Request::new()
+            .with_method(msg.method().to_str())
+            .with_params(msg);
+
         let mut json_str = serde_json::to_string(&push_req)?;
         json_str += "\n";
 

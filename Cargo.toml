@@ -9,6 +9,10 @@ categories = ["network-programming"]
 repository = "https://github.com/ssp-rs/ssp-server"
 license = "MIT"
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "doc_cfg"]
+
 [dependencies]
 bus = "2.4"
 env_logger = "0.10"
@@ -32,6 +36,7 @@ features = ["std"]
 optional = true
 
 [features]
+default = ["jsonrpc"]
 test-e2e = []
 test-rainbow = []
 jsonrpc = ["serde_json", "smol-jsonrpc", "ssp/jsonrpc"]
