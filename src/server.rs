@@ -254,6 +254,9 @@ impl Server {
 
                 self.bus_mut()?.broadcast(msg);
             }
+
+            // Sleep for a bit to avoid a tight loop
+            thread::sleep(time::Duration::from_millis(250));
         }
 
         Ok(())
