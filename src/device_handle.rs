@@ -561,8 +561,8 @@ impl DeviceHandle {
                 set_jsonrpc_id(jsonrpc_id);
 
                 match method {
-                    ssp::Method::Disable => self.on_disable(stream, &event)?,
-                    ssp::Method::Enable => self.on_enable(stream, &event)?,
+                    ssp::Method::Disable | ssp::Method::Stop => self.on_disable(stream, &event)?,
+                    ssp::Method::Enable | ssp::Method::Accept => self.on_enable(stream, &event)?,
                     ssp::Method::Reject => self.on_reject(stream, &event)?,
                     ssp::Method::Stack => self.on_stack(stream, &event)?,
                     ssp::Method::StackerFull => self.on_stacker_full(stream, &event)?,
