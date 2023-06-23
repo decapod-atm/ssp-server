@@ -44,7 +44,7 @@ static POLLING_INIT: AtomicBool = AtomicBool::new(false);
 static ESCROWED: AtomicBool = AtomicBool::new(false);
 static ESCROWED_AMOUNT: AtomicU32 = AtomicU32::new(0);
 
-static CASHBOX_AVAILABLE: AtomicBool = AtomicBool::new(true);
+static CASHBOX_ATTACHED: AtomicBool = AtomicBool::new(true);
 
 // Time when a device reset was initiated.
 static RESET_TIME: AtomicU64 = AtomicU64::new(0);
@@ -93,13 +93,15 @@ pub(crate) fn set_escrowed_amount(amount: ssp::ChannelValue) -> ssp::ChannelValu
     last
 }
 
-pub(crate) fn cashbox_available() -> bool {
-    CASHBOX_AVAILABLE.load(Ordering::Relaxed)
+/// Gets whether the csahboxed is attached to the device.
+pub fn cashbox_attached() -> bool {
+    CASHBOX_ATTACHED.load(Ordering::Relaxed)
 }
 
-pub(crate) fn set_cashbox_available(available: bool) -> bool {
-    let last = cashbox_available();
-    CASHBOX_AVAILABLE.store(available, Ordering::SeqCst);
+/// Sets whether the csahboxed is attached to the device.
+pub fn set_cashbox_attached(attached: bool) -> bool {
+    let last = cashbox_attached();
+    CASHBOX_ATTACHED.store(attached, Ordering::SeqCst);
     last
 }
 
@@ -579,7 +581,7 @@ impl DeviceHandle {
     }
 
     /// Message handler for [Disable](ssp::Event::DisableEvent) events.
-    /// 
+    ///
     /// Exposed to help with creating a custom message handler.
     #[cfg(feature = "jsonrpc")]
     pub fn on_disable(&self, stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
@@ -597,7 +599,7 @@ impl DeviceHandle {
     }
 
     /// Message handler for [Enable](ssp::Event::EnableEvent) events.
-    /// 
+    ///
     /// Exposed to help with creating a custom message handler.
     #[cfg(feature = "jsonrpc")]
     pub fn on_enable(&self, stream: &mut UnixStream, event: &ssp::Event) -> Result<()> {
@@ -618,7 +620,7 @@ impl DeviceHandle {
     }
 
     /// Message handler for [Reject](ssp::Event::RejectEvent) events.
-    /// 
+    ///
     /// Exposed to help with creating a custom message handler.
     #[cfg(feature = "jsonrpc")]
     pub fn on_reject(&self, stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
@@ -636,7 +638,7 @@ impl DeviceHandle {
     }
 
     /// Message handler for [Stack](ssp::Event::StackEvent) events.
-    /// 
+    ///
     /// Exposed to help with creating a custom message handler.
     #[cfg(feature = "jsonrpc")]
     pub fn on_stack(&self, stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
@@ -654,7 +656,7 @@ impl DeviceHandle {
     }
 
     /// Message handler for [StackerFull](ssp::Event::StackerFullEvent) events.
-    /// 
+    ///
     /// Exposed to help with creating a custom message handler.
     #[cfg(feature = "jsonrpc")]
     pub fn on_stacker_full(&self, _stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
@@ -664,17 +666,16 @@ impl DeviceHandle {
     }
 
     /// Message handler for [Status](ssp::Event::StatusEvent) events.
-    /// 
+    ///
     /// Exposed to help with creating a custom message handler.
     #[cfg(feature = "jsonrpc")]
     pub fn on_status(&self, stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
         let data = self.unit_data()?;
 
-        let cashbox_available = cashbox_available();
-        let status = ssp::DeviceStatus::from(data)
-            .with_cashbox_attached(cashbox_available);
+        let cashbox_attached = cashbox_attached();
+        let status = ssp::DeviceStatus::from(data).with_cashbox_attached(cashbox_attached);
 
-        let event = if cashbox_available {
+        let event = if cashbox_attached {
             ssp::StatusEvent::new(status)
         } else {
             ssp::StatusEvent::new(status.with_response_status(ssp::ResponseStatus::CashboxRemoved))
@@ -692,7 +693,7 @@ impl DeviceHandle {
     }
 
     /// Message handler for [Status](ssp::Event::StatusEvent) events.
-    /// 
+    ///
     /// Exposed to help with creating a custom message handler.
     ///
     /// **WARNING**: currently, the server requires a restart after a device reset. This seems to

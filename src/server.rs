@@ -35,7 +35,7 @@ fn set_stop_serving_client(s: bool) {
 ///
 /// Optionally, can be used interactively with a client connection.
 pub struct Server {
-    handle: Arc<Mutex<DeviceHandle>>,
+    pub handle: Arc<Mutex<DeviceHandle>>,
     #[cfg(feature = "jsonrpc")]
     socket_path: Option<String>,
     #[cfg(feature = "jsonrpc")]
@@ -113,7 +113,10 @@ impl Server {
         Self::lock_handle(&self.handle)
     }
 
-    fn lock_handle(handle: &Arc<Mutex<DeviceHandle>>) -> Result<MutexGuard<'_, DeviceHandle>> {
+    /// Aquires a lock on the [DeviceHandle].
+    ///
+    /// Returns an `Err(_)` if the timeout expires before acquiring the lock.
+    pub fn lock_handle(handle: &Arc<Mutex<DeviceHandle>>) -> Result<MutexGuard<'_, DeviceHandle>> {
         let now = time::Instant::now();
 
         while now.elapsed().as_millis() < HANDLE_TIMEOUT_MS {
