@@ -35,7 +35,7 @@ fn set_stop_serving_client(s: bool) {
 ///
 /// Optionally, can be used interactively with a client connection.
 pub struct Server {
-    handle: Arc<Mutex<DeviceHandle>>,
+    pub handle: Arc<Mutex<DeviceHandle>>,
     #[cfg(feature = "jsonrpc")]
     socket_path: Option<String>,
     #[cfg(feature = "jsonrpc")]
@@ -74,6 +74,7 @@ impl Server {
     /// Creates a new [Server] that interactively handles device events via
     /// a client connects over Unix domain sockets.
     #[cfg(feature = "jsonrpc")]
+    #[cfg_attr(doc_cfg, doc(cfg(feature = "jsonrpc")))]
     pub fn new_uds(
         serial_path: &str,
         socket_path: &str,
@@ -112,7 +113,10 @@ impl Server {
         Self::lock_handle(&self.handle)
     }
 
-    fn lock_handle(handle: &Arc<Mutex<DeviceHandle>>) -> Result<MutexGuard<'_, DeviceHandle>> {
+    /// Aquires a lock on the [DeviceHandle].
+    ///
+    /// Returns an `Err(_)` if the timeout expires before acquiring the lock.
+    pub fn lock_handle(handle: &Arc<Mutex<DeviceHandle>>) -> Result<MutexGuard<'_, DeviceHandle>> {
         let now = time::Instant::now();
 
         while now.elapsed().as_millis() < HANDLE_TIMEOUT_MS {
@@ -271,7 +275,10 @@ impl Server {
     fn send(stream: &mut UnixStream, msg: &Event) -> Result<()> {
         log::debug!("Sending push event: {msg}");
 
-        let push_req = smol_jsonrpc::Request::new().with_params(msg);
+        let push_req = smol_jsonrpc::Request::new()
+            .with_method(msg.method().to_str())
+            .with_params(msg);
+
         let mut json_str = serde_json::to_string(&push_req)?;
         json_str += "\n";
 

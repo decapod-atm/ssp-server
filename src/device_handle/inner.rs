@@ -7,7 +7,7 @@ use ssp::MessageOps;
 use crate::continue_on_err;
 
 use super::{
-    cashbox_available, set_cashbox_available, set_escrowed, set_escrowed_amount, DeviceHandle,
+    cashbox_attached, set_cashbox_attached, set_escrowed, set_escrowed_amount, DeviceHandle,
 };
 
 impl DeviceHandle {
@@ -25,12 +25,12 @@ impl DeviceHandle {
         while idx < data_len {
             let status = ssp::ResponseStatus::from(data[idx]);
 
-            if !(cashbox_available()
+            if !(cashbox_attached()
                 || status == ssp::ResponseStatus::Disabled
                 || status == ssp::ResponseStatus::StackerFull
                 || status == ssp::ResponseStatus::CashboxRemoved)
             {
-                set_cashbox_available(true);
+                set_cashbox_attached(true);
 
                 log::debug!("Cashbox is available: {status}");
 
@@ -96,10 +96,10 @@ impl DeviceHandle {
 
                     idx += ssp::CashboxRemovedEvent::len();
 
-                    if cashbox_available() {
+                    if cashbox_attached() {
                         log::debug!("Cashbox is removed");
 
-                        set_cashbox_available(false);
+                        set_cashbox_attached(false);
 
                         continue_on_err!(
                             tx.send(ssp::Event::from(event)),
@@ -115,10 +115,10 @@ impl DeviceHandle {
 
                     idx += ssp::CashboxReplacedEvent::len();
 
-                    if !cashbox_available() {
+                    if !cashbox_attached() {
                         log::debug!("Cashbox replaced");
 
-                        set_cashbox_available(true);
+                        set_cashbox_attached(true);
 
                         continue_on_err!(
                             tx.send(ssp::Event::from(event)),
@@ -207,14 +207,14 @@ impl DeviceHandle {
                     );
                     idx += ssp::StackerFullEvent::len();
 
-                    if cashbox_available() {
+                    if cashbox_attached() {
                         // Some firmware/protocol versions seem to send this message for the
                         // cashbox being removed, and the stacker being full. TBD.
                         log::debug!(
                             "Cashbox is unavailable. It was either removed, or the stacker is full"
                         );
 
-                        set_cashbox_available(false);
+                        set_cashbox_attached(false);
 
                         continue_on_err!(
                             tx.send(ssp::Event::from(event)),

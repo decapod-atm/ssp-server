@@ -702,9 +702,9 @@ dependencies = [
 
 [[package]]
 name = "ssp"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e492166d4e78bcb4380b5799867db1c0763cc2c783854f32a52955987744478"
+checksum = "42741febbf98c8f0be8139e53f822c0210dd3a3dae7ed4c04e2a561484ad4d66"
 dependencies = [
  "aes",
  "bitfield",
@@ -727,7 +727,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-server"
-version = "0.1.2"
+version = "0.1.4"
 dependencies = [
  "bus",
  "env_logger",

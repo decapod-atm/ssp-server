@@ -1,3 +1,5 @@
+#![cfg_attr(doc_cfg, feature(doc_cfg))]
+
 pub mod device_handle;
 #[macro_use]
 mod macros;
