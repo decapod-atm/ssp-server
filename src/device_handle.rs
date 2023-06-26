@@ -30,11 +30,13 @@ pub const LOCK_TIMEOUT_MS: u64 = 5_000;
 pub const SERIAL_TIMEOUT_MS: u64 = 10_000;
 /// Minimum polling interval between messages (milliseconds).
 pub const MIN_POLLING_MS: u64 = 200;
+/// Medium polling interval between messages (milliseconds).
+pub const MED_POLLING_MS: u64 = 650;
 /// Maximum polling interval between messages (milliseconds).
 #[allow(dead_code)]
 pub const MAX_POLLING_MS: u64 = 1_000;
 /// Timeout for retrieving an event from a queue (milliseconds)
-pub const QUEUE_TIMEOUT_MS: u128 = 5_000;
+pub const QUEUE_TIMEOUT_MS: u128 = 50;
 /// Default serial connection BAUD rate (bps).
 pub const BAUD_RATE: u32 = 9_600;
 
@@ -295,10 +297,12 @@ impl DeviceHandle {
             let key = Arc::clone(&self.key);
 
             thread::spawn(move || -> Result<()> {
-                let now = time::Instant::now();
+                let mut now = time::Instant::now();
 
                 while !end_polling.load(Ordering::Relaxed) {
-                    if now.elapsed().as_millis() % MIN_POLLING_MS as u128 == 0 {
+                    if now.elapsed().as_millis() > MED_POLLING_MS as u128 {
+                        now = time::Instant::now();
+
                         if resetting() {
                             continue;
                         }
@@ -340,6 +344,8 @@ impl DeviceHandle {
                             log::warn!("Failed poll command, response status: {status}");
                         }
                     }
+
+                    thread::sleep(time::Duration::from_millis(MED_POLLING_MS / 3));
                 }
 
                 // Now that polling finished, reset the flag to allow another background routine to
@@ -411,18 +417,15 @@ impl DeviceHandle {
             let (tx, rx) = mpsc::channel();
 
             thread::spawn(move || -> Result<()> {
-                let now = time::Instant::now();
+                let mut now = time::Instant::now();
 
                 while !end_polling.load(Ordering::Relaxed) {
-                    if now.elapsed().as_millis() % MIN_POLLING_MS as u128 == 0 {
+                    if now.elapsed().as_millis() >= MED_POLLING_MS as u128 {
+                        now = time::Instant::now();
+
                         if resetting() {
                             continue;
                         }
-
-                        let mut locked_port = continue_on_err!(
-                            Self::lock_serial_port(&serial_port),
-                            "Failed to lock serial port in background polling routine"
-                        );
 
                         let key = continue_on_err!(
                             Self::lock_encryption_key(&key),
@@ -439,6 +442,12 @@ impl DeviceHandle {
 
                             // Send hold command to keep note in escrow until `stack` or `reject`
                             // is sent.
+
+                            let mut locked_port = continue_on_err!(
+                                Self::lock_serial_port(&serial_port),
+                                "Failed to lock serial port in background polling routine"
+                            );
+
                             let mut message = ssp::HoldCommand::new();
 
                             continue_on_err!(
@@ -449,12 +458,19 @@ impl DeviceHandle {
                             continue;
                         }
 
-                        let mut message = ssp::PollCommand::new();
+                        let res = {
+                            let mut locked_port = continue_on_err!(
+                                Self::lock_serial_port(&serial_port),
+                                "Failed to lock serial port in background polling routine"
+                            );
 
-                        let res = continue_on_err!(
-                            Self::poll_message(&mut locked_port, &mut message, key.as_ref()),
-                            "Failed poll command"
-                        );
+                            let mut message = ssp::PollCommand::new();
+
+                            continue_on_err!(
+                                Self::poll_message(&mut locked_port, &mut message, key.as_ref()),
+                                "Failed poll command"
+                            )
+                        };
 
                         let status = res.as_response().response_status();
                         if status.is_ok() {
@@ -468,6 +484,8 @@ impl DeviceHandle {
                             log::warn!("Failed poll command, response status: {status}");
                         }
                     }
+
+                    thread::sleep(time::Duration::from_millis(MED_POLLING_MS / 3));
                 }
 
                 // Now that polling finished, reset the flag to allow another background routine to
