@@ -713,23 +713,10 @@ impl DeviceHandle {
     /// Message handler for [Status](ssp::Event::StatusEvent) events.
     ///
     /// Exposed to help with creating a custom message handler.
-    ///
-    /// **WARNING**: currently, the server requires a restart after a device reset. This seems to
-    /// be implementation specific, since the documentation describes a procedure for re-enabling
-    /// the device without a server restart. However, following the documentation procedure results
-    /// in an inoperable server... TBD.
-    // FIXME: the server needs to restart after the device is reset, then everything works as
-    // normal.
-    //
-    // Otherwise, the server will be stuck, or receive garbage data from the device.
-    //
-    // Unsure how to fix this, since the SSP docs have contradicting instructions for the Sync
-    // command (the Implementation Guide says it resets the Sequence Flag to one, the Protocol
-    // Guide says it resets to zero...
-    //
-    // Regardless, neither value works, and the only thing that works is a server reset...
     #[cfg(feature = "jsonrpc")]
     pub fn on_reset(&self, stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
+        use serialport::SerialPort;
+
         self.reset()?;
 
         let now = time::Instant::now();
@@ -738,16 +725,31 @@ impl DeviceHandle {
         thread::sleep(time::Duration::from_secs(20));
 
         let mut serial_port = self.serial_port()?;
+        // Clear the serial port to simulate closing and opening the port
+        serial_port.clear(serialport::ClearBuffer::All)?;
 
         while now.elapsed().as_secs() < RESET_TIMEOUT_SECS {
             if let Ok(res) = self.sync_inner(&mut serial_port) {
                 if res.response_status().is_ok() {
                     set_reset_time(0);
 
+                    if let Err(err) = self.enable_device_inner(&mut serial_port, protocol_version())
+                    {
+                        log::error!("Error enabling device after reset: {err}");
+                    }
+
+                    if interactive() {
+                        // if the server is running in interactive mode, disable until the client
+                        // re-enables the device.
+                        if let Err(err) = self.disable_inner(&mut serial_port) {
+                            log::error!("Error disabling device after reset: {err}");
+                        }
+                    }
+
                     let poll_res = self.poll_inner(&mut serial_port)?;
                     if poll_res.response_status().is_ok() {
-                        let mut res = Response::from(ssp::Event::from(ssp::ResetEvent::new()));
-                        res.set_id(jsonrpc_id());
+                        let res = Response::from(ssp::Event::from(ssp::ResetEvent::new()))
+                            .with_id(jsonrpc_id());
 
                         let mut res_str = serde_json::to_string(&res)?;
                         res_str += "\n";
@@ -755,20 +757,6 @@ impl DeviceHandle {
                         log::debug!("Successfully reset device: {res_str}");
 
                         stream.write_all(res_str.as_bytes())?;
-
-                        if let Err(err) =
-                            self.enable_device_inner(&mut serial_port, protocol_version())
-                        {
-                            log::error!("Error enabling device after reset: {err}");
-                        }
-
-                        if interactive() {
-                            // if the server is running in interactive mode, disable until the client
-                            // re-enables the device.
-                            if let Err(err) = self.disable_inner(&mut serial_port) {
-                                log::error!("Error disabling device after reset: {err}");
-                            }
-                        }
 
                         return Ok(());
                     } else {
