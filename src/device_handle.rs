@@ -681,10 +681,18 @@ impl DeviceHandle {
     /// Exposed to help with creating a custom message handler.
     #[cfg(feature = "jsonrpc")]
     pub fn on_status(&self, stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
-        let data = self.unit_data()?;
+        let (data, dataset_version) = {
+            let mut serial_port = self.serial_port()?;
+            let key = self.encryption_key()?;
+
+            (self.unit_data_inner(&mut serial_port, key.as_ref())?,
+            Self::dataset_version_inner(&mut serial_port, key.as_ref())?)
+        };
 
         let cashbox_attached = cashbox_attached();
-        let status = ssp::DeviceStatus::from(data).with_cashbox_attached(cashbox_attached);
+        let status = ssp::DeviceStatus::from(data)
+            .with_dataset_version(dataset_version.dataset_version()?)
+            .with_cashbox_attached(cashbox_attached);
 
         let event = if cashbox_attached {
             ssp::StatusEvent::new(status)
@@ -1330,6 +1338,20 @@ impl DeviceHandle {
         let response = Self::poll_message(serial_port, &mut message, key)?;
 
         response.into_unit_data_response()
+    }
+
+    pub fn dataset_version(&self) -> Result<ssp::DatasetVersionResponse> {
+        let mut serial_port = self.serial_port()?;
+
+        Self::dataset_version_inner(&mut serial_port, encryption_key!(self))
+    }
+
+    pub fn dataset_version_inner(serial_port: &mut TTYPort, key: Option<&ssp::AesKey>) -> Result<ssp::DatasetVersionResponse> {
+        let mut message = ssp::DatasetVersionCommand::new();
+
+        let response = Self::poll_message(serial_port, &mut message, key)?;
+
+        response.into_dataset_version_response()
     }
 
     /// Send a [ChannelValueDataCommand](ssp::ChannelValueDataCommand) message to the device.

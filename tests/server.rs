@@ -310,6 +310,14 @@ fn test_e2e_server() -> Result<(), Vec<ssp::Error>> {
         }
     }
 
+    match handle.dataset_version() {
+        Ok(res) => log::debug!("Dataset version command succeeded: {res}"),
+        Err(err) => {
+            log::error!("Failed dataset version command: {err}");
+            errs.push(err);
+        }
+    }
+
     // Perform key negotiation sequence
 
     // Reset the encryption key to default
