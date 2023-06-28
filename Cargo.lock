@@ -727,7 +727,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-server"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bus",
  "env_logger",

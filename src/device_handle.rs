@@ -420,12 +420,17 @@ impl DeviceHandle {
                 let mut now = time::Instant::now();
 
                 while !end_polling.load(Ordering::Relaxed) {
-                    if now.elapsed().as_millis() >= MED_POLLING_MS as u128 {
+                    if now.elapsed().as_millis() >= MIN_POLLING_MS as u128 {
                         now = time::Instant::now();
 
                         if resetting() {
                             continue;
                         }
+
+                        let mut locked_port = continue_on_err!(
+                            Self::lock_serial_port(&serial_port),
+                            "Failed to lock serial port in background polling routine"
+                        );
 
                         let key = continue_on_err!(
                             Self::lock_encryption_key(&key),
@@ -443,11 +448,6 @@ impl DeviceHandle {
                             // Send hold command to keep note in escrow until `stack` or `reject`
                             // is sent.
 
-                            let mut locked_port = continue_on_err!(
-                                Self::lock_serial_port(&serial_port),
-                                "Failed to lock serial port in background polling routine"
-                            );
-
                             let mut message = ssp::HoldCommand::new();
 
                             continue_on_err!(
@@ -458,19 +458,12 @@ impl DeviceHandle {
                             continue;
                         }
 
-                        let res = {
-                            let mut locked_port = continue_on_err!(
-                                Self::lock_serial_port(&serial_port),
-                                "Failed to lock serial port in background polling routine"
-                            );
+                        let mut message = ssp::PollCommand::new();
 
-                            let mut message = ssp::PollCommand::new();
-
-                            continue_on_err!(
-                                Self::poll_message(&mut locked_port, &mut message, key.as_ref()),
-                                "Failed poll command"
-                            )
-                        };
+                        let res = continue_on_err!(
+                            Self::poll_message(&mut locked_port, &mut message, key.as_ref()),
+                            "Failed poll command"
+                        );
 
                         let status = res.as_response().response_status();
                         if status.is_ok() {
@@ -485,7 +478,7 @@ impl DeviceHandle {
                         }
                     }
 
-                    thread::sleep(time::Duration::from_millis(MED_POLLING_MS / 3));
+                    thread::sleep(time::Duration::from_millis(MIN_POLLING_MS / 3));
                 }
 
                 // Now that polling finished, reset the flag to allow another background routine to
@@ -741,12 +734,12 @@ impl DeviceHandle {
                     if interactive() {
                         // if the server is running in interactive mode, disable until the client
                         // re-enables the device.
-                        if let Err(err) = self.disable_inner(&mut serial_port) {
+                        if let Err(err) = self.disable_inner(&mut serial_port, None) {
                             log::error!("Error disabling device after reset: {err}");
                         }
                     }
 
-                    let poll_res = self.poll_inner(&mut serial_port)?;
+                    let poll_res = self.poll_inner(&mut serial_port, None)?;
                     if poll_res.response_status().is_ok() {
                         let res = Response::from(ssp::Event::from(ssp::ResetEvent::new()))
                             .with_id(jsonrpc_id());
@@ -781,7 +774,7 @@ impl DeviceHandle {
         serial_port: &Arc<Mutex<TTYPort>>,
     ) -> Result<MutexGuard<'_, TTYPort>> {
         serial_port
-            .try_lock_for(time::Duration::from_millis(LOCK_TIMEOUT_MS))
+            .try_lock_for(time::Duration::from_millis(SERIAL_TIMEOUT_MS))
             .ok_or(ssp::Error::SerialPort(
                 "timed out locking serial port".into(),
             ))
@@ -888,18 +881,19 @@ impl DeviceHandle {
         enable_list: ssp::EnableBitfieldList,
     ) -> Result<ssp::SetInhibitsResponse> {
         let mut serial_port = self.serial_port()?;
-        self.set_inhibits_inner(&mut serial_port, enable_list)
+        self.set_inhibits_inner(&mut serial_port, enable_list, encryption_key!(self))
     }
 
     fn set_inhibits_inner(
         &self,
         serial_port: &mut TTYPort,
         enable_list: ssp::EnableBitfieldList,
+        key: Option<&ssp::AesKey>,
     ) -> Result<ssp::SetInhibitsResponse> {
         let mut message = ssp::SetInhibitsCommand::new();
         message.set_inhibits(enable_list)?;
 
-        let res = Self::poll_message(serial_port, &mut message, encryption_key!(self))?;
+        let res = Self::poll_message(serial_port, &mut message, key)?;
 
         res.into_set_inhibits_response()
     }
@@ -932,15 +926,19 @@ impl DeviceHandle {
     pub fn poll(&self) -> Result<ssp::PollResponse> {
         let mut serial_port = self.serial_port()?;
 
-        self.poll_inner(&mut serial_port)
+        self.poll_inner(&mut serial_port, encryption_key!(self))
     }
 
-    fn poll_inner(&self, serial_port: &mut TTYPort) -> Result<ssp::PollResponse> {
+    fn poll_inner(
+        &self,
+        serial_port: &mut TTYPort,
+        key: Option<&ssp::AesKey>,
+    ) -> Result<ssp::PollResponse> {
         let mut message = ssp::PollCommand::new();
 
         Self::set_message_sequence_flag(&mut message);
 
-        let response = Self::poll_message(serial_port, &mut message, encryption_key!(self))?;
+        let response = Self::poll_message(serial_port, &mut message, key)?;
 
         response.into_poll_response()
     }
@@ -1027,13 +1025,15 @@ impl DeviceHandle {
         serial_port: &mut TTYPort,
         protocol_version: ssp::ProtocolVersion,
     ) -> Result<ssp::EnableResponse> {
-        self.poll_inner(serial_port)?;
+        self.poll_inner(serial_port, None)?;
 
-        let status_res = self.unit_data_inner(serial_port)?;
-        self.serial_number_inner(serial_port)?;
+        // FIXME: make these *_inner functions accept a locked encryption key also to avoid
+        // deadlocks from locking and unlocking the mutex
+        let status_res = self.unit_data_inner(serial_port, None)?;
+        self.serial_number_inner(serial_port, None)?;
 
         if status_res.protocol_version() != protocol_version {
-            self.host_protocol_version_inner(serial_port, protocol_version)?;
+            self.host_protocol_version_inner(serial_port, protocol_version, None)?;
             set_protocol_version(protocol_version);
         }
 
@@ -1044,22 +1044,26 @@ impl DeviceHandle {
             ssp::EnableBitfield::from(0xff),
         ]);
 
-        self.set_inhibits_inner(serial_port, enable_list)?;
-        self.channel_value_data_inner(serial_port)?;
+        self.set_inhibits_inner(serial_port, enable_list, None)?;
+        self.channel_value_data_inner(serial_port, None)?;
 
-        self.enable_inner(serial_port)
+        self.enable_inner(serial_port, None)
     }
 
     /// Send a [EnableCommand](ssp::EnableCommand) message to the device.
     pub fn enable(&self) -> Result<ssp::EnableResponse> {
         let mut serial_port = self.serial_port()?;
-        self.enable_inner(&mut serial_port)
+        self.enable_inner(&mut serial_port, encryption_key!(self))
     }
 
-    fn enable_inner(&self, serial_port: &mut TTYPort) -> Result<ssp::EnableResponse> {
+    fn enable_inner(
+        &self,
+        serial_port: &mut TTYPort,
+        key: Option<&ssp::AesKey>,
+    ) -> Result<ssp::EnableResponse> {
         let mut message = ssp::EnableCommand::new();
 
-        let response = Self::poll_message(serial_port, &mut message, encryption_key!(self))?;
+        let response = Self::poll_message(serial_port, &mut message, key)?;
 
         response.into_enable_response()
     }
@@ -1067,13 +1071,17 @@ impl DeviceHandle {
     /// Send a [DisableCommand](ssp::DisableCommand) message to the device.
     pub fn disable(&self) -> Result<ssp::DisableResponse> {
         let mut serial_port = self.serial_port()?;
-        self.disable_inner(&mut serial_port)
+        self.disable_inner(&mut serial_port, encryption_key!(self))
     }
 
-    fn disable_inner(&self, serial_port: &mut TTYPort) -> Result<ssp::DisableResponse> {
+    fn disable_inner(
+        &self,
+        serial_port: &mut TTYPort,
+        key: Option<&ssp::AesKey>,
+    ) -> Result<ssp::DisableResponse> {
         let mut message = ssp::DisableCommand::new();
 
-        let response = Self::poll_message(serial_port, &mut message, encryption_key!(self))?;
+        let response = Self::poll_message(serial_port, &mut message, key)?;
 
         response.into_disable_response()
     }
@@ -1137,18 +1145,19 @@ impl DeviceHandle {
     ) -> Result<ssp::HostProtocolVersionResponse> {
         let mut serial_port = self.serial_port()?;
 
-        self.host_protocol_version_inner(&mut serial_port, protocol_version)
+        self.host_protocol_version_inner(&mut serial_port, protocol_version, encryption_key!(self))
     }
 
     fn host_protocol_version_inner(
         &self,
         serial_port: &mut TTYPort,
         protocol_version: ssp::ProtocolVersion,
+        key: Option<&ssp::AesKey>,
     ) -> Result<ssp::HostProtocolVersionResponse> {
         let mut message = ssp::HostProtocolVersionCommand::new();
         message.set_version(protocol_version);
 
-        let response = Self::poll_message(serial_port, &mut message, encryption_key!(self))?;
+        let response = Self::poll_message(serial_port, &mut message, key)?;
 
         response.into_host_protocol_version_response()
     }
@@ -1156,13 +1165,17 @@ impl DeviceHandle {
     /// Send a [SerialNumberCommand](ssp::SerialNumberCommand) message to the device.
     pub fn serial_number(&self) -> Result<ssp::SerialNumberResponse> {
         let mut serial_port = self.serial_port()?;
-        self.serial_number_inner(&mut serial_port)
+        self.serial_number_inner(&mut serial_port, encryption_key!(self))
     }
 
-    fn serial_number_inner(&self, serial_port: &mut TTYPort) -> Result<ssp::SerialNumberResponse> {
+    fn serial_number_inner(
+        &self,
+        serial_port: &mut TTYPort,
+        key: Option<&ssp::AesKey>,
+    ) -> Result<ssp::SerialNumberResponse> {
         let mut message = ssp::SerialNumberCommand::new();
 
-        let res = Self::poll_message(serial_port, &mut message, encryption_key!(self))?;
+        let res = Self::poll_message(serial_port, &mut message, key)?;
 
         res.into_serial_number_response()
     }
@@ -1304,13 +1317,17 @@ impl DeviceHandle {
     pub fn unit_data(&self) -> Result<ssp::UnitDataResponse> {
         let mut serial_port = self.serial_port()?;
 
-        self.unit_data_inner(&mut serial_port)
+        self.unit_data_inner(&mut serial_port, encryption_key!(self))
     }
 
-    fn unit_data_inner(&self, serial_port: &mut TTYPort) -> Result<ssp::UnitDataResponse> {
+    fn unit_data_inner(
+        &self,
+        serial_port: &mut TTYPort,
+        key: Option<&ssp::AesKey>,
+    ) -> Result<ssp::UnitDataResponse> {
         let mut message = ssp::UnitDataCommand::new();
 
-        let response = Self::poll_message(serial_port, &mut message, encryption_key!(self))?;
+        let response = Self::poll_message(serial_port, &mut message, key)?;
 
         response.into_unit_data_response()
     }
@@ -1319,16 +1336,17 @@ impl DeviceHandle {
     pub fn channel_value_data(&self) -> Result<ssp::ChannelValueDataResponse> {
         let mut serial_port = self.serial_port()?;
 
-        self.channel_value_data_inner(&mut serial_port)
+        self.channel_value_data_inner(&mut serial_port, encryption_key!(self))
     }
 
     fn channel_value_data_inner(
         &self,
         serial_port: &mut TTYPort,
+        key: Option<&ssp::AesKey>,
     ) -> Result<ssp::ChannelValueDataResponse> {
         let mut message = ssp::ChannelValueDataCommand::new();
 
-        let response = Self::poll_message(serial_port, &mut message, encryption_key!(self))?;
+        let response = Self::poll_message(serial_port, &mut message, key)?;
 
         let res = response.into_channel_value_data_response()?;
 
