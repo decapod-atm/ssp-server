@@ -761,7 +761,7 @@ impl DeviceHandle {
 
                     let poll_res = self.poll_inner(&mut serial_port, None)?;
                     if poll_res.response_status().is_ok() {
-                        log::debug!("Successfully reset device: {res_str}");
+                        log::debug!("Successfully reset device");
 
                         return Ok(());
                     } else {
