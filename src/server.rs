@@ -91,7 +91,10 @@ impl Server {
         while let Err(err) = handle.enable_device(protocol_version) {
             log::error!("error enabling device: {err}, resetting");
 
-            handle.full_reset()?;
+            if let Err(err) = handle.full_reset() {
+                log::error!("error resetting device: {err}");
+            }
+
             reset_count += 1;
 
             if reset_count >= MAX_RESETS {
