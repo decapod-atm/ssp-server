@@ -17,6 +17,7 @@ use crate::DeviceHandle;
 use crate::{continue_on_err, PollMode, PushEventReceiver};
 
 const HANDLE_TIMEOUT_MS: u128 = 5_000;
+const MAX_RESETS: u64 = 10;
 
 #[cfg(feature = "jsonrpc")]
 static STOP_SERVING_CLIENT: AtomicBool = AtomicBool::new(false);
@@ -84,8 +85,21 @@ impl Server {
         let handle = DeviceHandle::new(serial_path)?;
         let push_queue =
             Some(handle.start_background_polling_with_queue(stop_polling, PollMode::Interactive)?);
+
         // enable the device to fully configure
-        handle.enable_device(protocol_version)?;
+        let mut reset_count = 0;
+        while let Err(err) = handle.enable_device(protocol_version) {
+            log::error!("error enabling device: {err}, resetting");
+
+            handle.full_reset()?;
+            reset_count += 1;
+
+            if reset_count >= MAX_RESETS {
+                log::error!("maximum resets reached: {MAX_RESETS}");
+                break;
+            }
+        }
+
         // disable again to allow client to decide when to begin accepting notes
         handle.disable()?;
 

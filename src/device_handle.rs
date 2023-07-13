@@ -246,7 +246,7 @@ impl DeviceHandle {
         let mut modulus = ssp::ModulusKey::from_generator(&mut prime_gen);
 
         // Modulus key must be smaller than the Generator key
-        while modulus.as_inner() >= generator.as_inner() {
+        while modulus.as_inner() <= generator.as_inner() {
             modulus = ssp::ModulusKey::from_generator(&mut prime_gen);
         }
 
@@ -708,6 +708,26 @@ impl DeviceHandle {
     /// Exposed to help with creating a custom message handler.
     #[cfg(feature = "jsonrpc")]
     pub fn on_reset(&self, stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
+        match self.full_reset() {
+            Ok(_) => {
+                let res =
+                    Response::from(ssp::Event::from(ssp::ResetEvent::new())).with_id(jsonrpc_id());
+
+                let mut res_str = serde_json::to_string(&res)?;
+                res_str += "\n";
+
+                log::debug!("Successfully reset device: {res_str}");
+
+                stream.write_all(res_str.as_bytes())?;
+
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Performs the full reset protocol to restart a device.
+    pub fn full_reset(&self) -> Result<()> {
         use serialport::SerialPort;
 
         self.reset()?;
@@ -748,8 +768,6 @@ impl DeviceHandle {
                         res_str += "\n";
 
                         log::debug!("Successfully reset device: {res_str}");
-
-                        stream.write_all(res_str.as_bytes())?;
 
                         return Ok(());
                     } else {
