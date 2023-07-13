@@ -761,12 +761,6 @@ impl DeviceHandle {
 
                     let poll_res = self.poll_inner(&mut serial_port, None)?;
                     if poll_res.response_status().is_ok() {
-                        let res = Response::from(ssp::Event::from(ssp::ResetEvent::new()))
-                            .with_id(jsonrpc_id());
-
-                        let mut res_str = serde_json::to_string(&res)?;
-                        res_str += "\n";
-
                         log::debug!("Successfully reset device: {res_str}");
 
                         return Ok(());
