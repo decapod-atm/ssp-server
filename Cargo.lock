@@ -690,8 +690,9 @@ dependencies = [
 
 [[package]]
 name = "ssp"
-version = "0.3.0"
-source = "git+https://github.com/ssp-rs/ssp#359ff16990601a9e2812d4a1f912de33c2e7f961"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f18dd4ee81dfcd2d25775bbf133a5485da0d95ed095ebdce6a30f94ec0cf4051"
 dependencies = [
  "aes",
  "bitfield",
