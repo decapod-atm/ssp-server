@@ -242,16 +242,20 @@ impl DeviceHandle {
 
         let mut prime_gen = ssp::primes::Generator::from_entropy();
 
-        let generator = ssp::GeneratorKey::from_generator(&mut prime_gen);
+        let mut generator = ssp::GeneratorKey::from_generator(&mut prime_gen);
         let mut modulus = ssp::ModulusKey::from_generator(&mut prime_gen);
 
         // Modulus key must be smaller than the Generator key
-        while modulus.as_inner() <= generator.as_inner() {
-            modulus = ssp::ModulusKey::from_generator(&mut prime_gen);
+        let mod_inner = modulus.as_inner();
+        let gen_inner = generator.as_inner();
+
+        if gen_inner > mod_inner {
+            modulus = gen_inner.into();
+            generator = mod_inner.into();
         }
 
         let random = ssp::RandomKey::from_entropy();
-        let fixed_key = ssp::FixedKey::new();
+        let fixed_key = ssp::FixedKey::from_inner(ssp::DEFAULT_FIXED_KEY_U64);
         let key = Arc::new(Mutex::new(None));
 
         Ok(Self {
@@ -681,10 +685,20 @@ impl DeviceHandle {
     /// Exposed to help with creating a custom message handler.
     #[cfg(feature = "jsonrpc")]
     pub fn on_status(&self, stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
-        let data = self.unit_data()?;
+        let (data, dataset_version) = {
+            let mut serial_port = self.serial_port()?;
+            let key = self.encryption_key()?;
+
+            (
+                self.unit_data_inner(&mut serial_port, key.as_ref())?,
+                Self::dataset_version_inner(&mut serial_port, key.as_ref())?,
+            )
+        };
 
         let cashbox_attached = cashbox_attached();
-        let status = ssp::DeviceStatus::from(data).with_cashbox_attached(cashbox_attached);
+        let status = ssp::DeviceStatus::from(data)
+            .with_dataset_version(dataset_version.dataset_version()?)
+            .with_cashbox_attached(cashbox_attached);
 
         let event = if cashbox_attached {
             ssp::StatusEvent::new(status)
@@ -815,8 +829,12 @@ impl DeviceHandle {
         let mut modulus = ssp::ModulusKey::from_entropy();
 
         // Modulus key must be smaller than the Generator key
-        while modulus.as_inner() >= self.generator.as_inner() {
-            modulus = ssp::ModulusKey::from_entropy();
+        let gen_inner = self.generator.as_inner();
+        let mod_inner = modulus.as_inner();
+
+        if gen_inner < mod_inner {
+            self.generator = mod_inner.into();
+            modulus = gen_inner.into();
         }
 
         self.modulus = modulus;
@@ -849,7 +867,7 @@ impl DeviceHandle {
         let enc_key =
             ssp::EncryptionKey::from_keys(&inter_key, self.random_key(), self.modulus_key());
 
-        new_key[..8].copy_from_slice(enc_key.as_inner().to_le_bytes().as_ref());
+        new_key[8..].copy_from_slice(enc_key.as_inner().to_le_bytes().as_ref());
 
         key.replace(new_key);
 
@@ -1203,7 +1221,7 @@ impl DeviceHandle {
         let mut message = ssp::SetGeneratorCommand::new();
         message.set_generator(self.generator_key());
 
-        let response = Self::poll_message(&mut serial_port, &mut message, encryption_key!(self))?;
+        let response = Self::poll_message(&mut serial_port, &mut message, None)?;
 
         response.into_set_generator_response()
     }
@@ -1219,7 +1237,7 @@ impl DeviceHandle {
         let mut message = ssp::SetModulusCommand::new();
         message.set_modulus(self.modulus_key());
 
-        let response = Self::poll_message(&mut serial_port, &mut message, encryption_key!(self))?;
+        let response = Self::poll_message(&mut serial_port, &mut message, None)?;
 
         response.into_set_modulus_response()
     }
@@ -1242,8 +1260,7 @@ impl DeviceHandle {
             );
             message.set_intermediate_key(&inter_key);
 
-            let response =
-                Self::poll_message(&mut serial_port, &mut message, encryption_key!(self))?;
+            let response = Self::poll_message(&mut serial_port, &mut message, None)?;
 
             response.into_request_key_exchange_response()?
         };
@@ -1289,7 +1306,7 @@ impl DeviceHandle {
 
         let mut message = ssp::EncryptionResetCommand::new();
 
-        let response = Self::poll_message(&mut serial_port, &mut message, encryption_key!(self))?;
+        let response = Self::poll_message(&mut serial_port, &mut message, None)?;
 
         if response.as_response().response_status() == ssp::ResponseStatus::CommandCannotBeProcessed
         {
@@ -1342,6 +1359,23 @@ impl DeviceHandle {
         let response = Self::poll_message(serial_port, &mut message, key)?;
 
         response.into_unit_data_response()
+    }
+
+    pub fn dataset_version(&self) -> Result<ssp::DatasetVersionResponse> {
+        let mut serial_port = self.serial_port()?;
+
+        Self::dataset_version_inner(&mut serial_port, encryption_key!(self))
+    }
+
+    pub fn dataset_version_inner(
+        serial_port: &mut TTYPort,
+        key: Option<&ssp::AesKey>,
+    ) -> Result<ssp::DatasetVersionResponse> {
+        let mut message = ssp::DatasetVersionCommand::new();
+
+        let response = Self::poll_message(serial_port, &mut message, key)?;
+
+        response.into_dataset_version_response()
     }
 
     /// Send a [ChannelValueDataCommand](ssp::ChannelValueDataCommand) message to the device.
@@ -1547,6 +1581,10 @@ impl DeviceHandle {
         enc_cmd.set_message_data(message)?;
 
         let mut wrapped = enc_cmd.encrypt(key);
+
+        wrapped.calculate_checksum();
+        log::trace!("Encrypted message: {wrapped}");
+        log::trace!("Encrypted data: {:x?}", wrapped.data());
 
         let response = Self::poll_message_variant(serial_port, &mut wrapped)?;
 

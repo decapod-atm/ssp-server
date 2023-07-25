@@ -24,6 +24,7 @@ signal-hook = "0.3"
 [dependencies.ssp]
 version = "0.3"
 features = ["std"]
+git = "https://github.com/ssp-rs/ssp"
 
 [dependencies.serde_json]
 version = "1.0"
@@ -37,6 +38,7 @@ optional = true
 
 [features]
 default = ["jsonrpc"]
+test-crypto = []
 test-e2e = []
 test-rainbow = []
 jsonrpc = ["serde_json", "smol-jsonrpc", "ssp/jsonrpc"]

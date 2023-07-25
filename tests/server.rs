@@ -1,4 +1,4 @@
-#[cfg(feature = "test-e2e")]
+#[cfg(any(feature = "test-e2e", feature = "test-crypto"))]
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -489,4 +489,101 @@ fn test_rainbow_dance() -> ssp::Result<()> {
     handle.reset()?;
 
     Ok(())
+}
+
+#[test]
+#[cfg(feature = "test-crypto")]
+fn test_crypto_server() -> Result<(), Vec<ssp::Error>> {
+    common::init();
+
+    let stop_polling = Arc::new(AtomicBool::new(false));
+
+    let mut handle = match ssp_server::DeviceHandle::new("/dev/ttyUSB0") {
+        Ok(h) => h,
+        Err(err) => return Err(vec![err]),
+    };
+
+    /*
+    handle
+        .start_background_polling(Arc::clone(&stop_polling))
+        .ok();
+        */
+
+    let mut errs = Vec::with_capacity(48);
+
+    match handle.sync() {
+        Ok(res) => log::debug!("Sync command succeeded: {res}"),
+        Err(err) => {
+            log::error!("Failed sync command: {err}");
+            errs.push(err);
+        }
+    }
+
+    match handle.host_protocol_version(ssp::ProtocolVersion::Eight) {
+        Ok(res) => log::debug!("Host protocol version command succeeded: {res}"),
+        Err(err) => {
+            log::error!("Host protocol version command failed: {err}");
+            errs.push(err);
+        }
+    }
+
+    match handle.set_generator() {
+        Ok(res) => log::debug!("Set generator command succeeded: {res}"),
+        Err(err) => {
+            log::error!("Failed set generator command: {err}");
+            errs.push(err);
+        }
+    }
+
+    match handle.set_modulus() {
+        Ok(res) => log::debug!("Set modulus command succeeded: {res}"),
+        Err(err) => {
+            log::error!("Failed set modulus command: {err}");
+            errs.push(err);
+        }
+    }
+
+    match handle.request_key_exchange() {
+        Ok(res) => log::debug!("Request key exchange command succeeded: {res}"),
+        Err(err) => {
+            log::error!("Failed request key exchange command: {err}");
+            errs.push(err);
+        }
+    }
+
+    // Send messages that require encryption
+
+    match handle.empty() {
+        Ok(res) => log::debug!("Empty command succeeded: {res}"),
+        Err(err) => {
+            log::error!("Failed empty command: {err}");
+            errs.push(err);
+        }
+    };
+
+    match handle.smart_empty() {
+        Ok(res) => log::debug!("Smart empty command succeeded: {res}"),
+        Err(err) => {
+            log::error!("Failed smart empty command: {err}");
+            errs.push(err);
+        }
+    };
+
+    // Reset the device
+
+    match handle.full_reset() {
+        Ok(_res) => log::debug!("Reset command succeeded"),
+        Err(err) => {
+            log::error!("Failed reset command: {err}");
+            errs.push(err);
+        }
+    }
+
+    stop_polling.store(true, Ordering::SeqCst);
+
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs)
+    }
 }
