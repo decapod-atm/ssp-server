@@ -22,9 +22,8 @@ serialport = { version = "4.2", default-features = false }
 signal-hook = "0.3"
 
 [dependencies.ssp]
-version = "0.3"
+version = "0.4"
 features = ["std"]
-git = "https://github.com/ssp-rs/ssp"
 
 [dependencies.serde_json]
 version = "1.0"
