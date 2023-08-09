@@ -14,7 +14,7 @@ use parking_lot::{Mutex, MutexGuard};
 use serialport::TTYPort;
 
 #[cfg(feature = "jsonrpc")]
-use smol_jsonrpc::{Request, Response};
+use smol_jsonrpc::{Error as RpcError, Request, Response};
 
 #[cfg(feature = "jsonrpc")]
 use ssp::jsonrpc::{jsonrpc_id, set_jsonrpc_id};
@@ -45,6 +45,8 @@ static POLLING_INIT: AtomicBool = AtomicBool::new(false);
 
 static ESCROWED: AtomicBool = AtomicBool::new(false);
 static ESCROWED_AMOUNT: AtomicU32 = AtomicU32::new(0);
+
+static ENABLED: AtomicBool = AtomicBool::new(false);
 
 static CASHBOX_ATTACHED: AtomicBool = AtomicBool::new(true);
 
@@ -83,6 +85,14 @@ pub(crate) fn set_escrowed(escrowed: bool) -> bool {
     let last = ESCROWED.load(Ordering::Relaxed);
     ESCROWED.store(escrowed, Ordering::SeqCst);
     last
+}
+
+pub(crate) fn enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_enabled(enabled: bool) {
+    ENABLED.store(enabled, Ordering::SeqCst);
 }
 
 pub(crate) fn escrowed_amount() -> ssp::ChannelValue {
@@ -154,7 +164,7 @@ pub enum PollMode {
 /// Receiver end of the device-sent event queue.
 ///
 /// Owner of the receiver can regularly attempt to pop events from the queue,
-/// and decide how to handle an returned event(s).
+/// and decide how to handle any returned event(s).
 ///
 /// Example:
 ///
@@ -441,7 +451,7 @@ impl DeviceHandle {
                             "Failed to lock encryption key in background polling routine"
                         );
 
-                        if escrowed() && poll_mode == PollMode::Interactive {
+                        if (escrowed() && poll_mode == PollMode::Interactive) || enabled() {
                             // Do not automatically poll when device has a bill in escrow,
                             // and the user is in interactive mode.
                             //
@@ -477,6 +487,9 @@ impl DeviceHandle {
                             );
 
                             Self::parse_events(&poll_res, &tx)?;
+                        } else if status.to_u8() == 0 {
+                            log::info!("Device returned a null response: {}", res.as_response());
+                            log::trace!("Response data: {:x?}", res.as_response().buf());
                         } else {
                             log::warn!("Failed poll command, response status: {status}");
                         }
@@ -585,6 +598,7 @@ impl DeviceHandle {
                     ssp::Method::StackerFull => self.on_stacker_full(stream, &event)?,
                     ssp::Method::Status => self.on_status(stream, &event)?,
                     ssp::Method::Reset => self.on_reset(stream, &event)?,
+                    ssp::Method::Dispense => self.on_dispense(stream, &event)?,
                     _ => return Err(ssp::Error::JsonRpc("unsupported method".into())),
                 }
 
@@ -709,8 +723,7 @@ impl DeviceHandle {
         let mut res = Response::from(ssp::Event::from(event));
         res.set_id(jsonrpc_id());
 
-        let mut res_str = serde_json::to_string(&res)?;
-        res_str += "\n";
+        let res_str = serde_json::to_string(&res)? + "\n";
 
         stream.write_all(res_str.as_bytes())?;
 
@@ -727,8 +740,7 @@ impl DeviceHandle {
                 let res =
                     Response::from(ssp::Event::from(ssp::ResetEvent::new())).with_id(jsonrpc_id());
 
-                let mut res_str = serde_json::to_string(&res)?;
-                res_str += "\n";
+                let res_str = serde_json::to_string(&res)? + "\n";
 
                 log::debug!("Successfully reset device: {res_str}");
 
@@ -789,6 +801,31 @@ impl DeviceHandle {
         }
 
         Err(ssp::Error::JsonRpc("failed to reset device".into()))
+    }
+
+    /// Message handle for dispense request using a
+    /// [PayoutDenominationList](ssp::PayoutDenominationList).
+    ///
+    /// User is responsible for parsing a request into a valid list.
+    ///
+    /// Exposed to help with creating a custom message handler.
+    #[cfg(feature = "jsonrpc")]
+    pub fn on_dispense(&self, stream: &mut UnixStream, event: &ssp::Event) -> Result<()> {
+        let inner_event = event.payload().as_dispense_event()?;
+
+        let res = if let Err(err) = self.payout_by_denomination(inner_event.as_inner()) {
+            Response::new()
+                .with_id(jsonrpc_id())
+                .with_error(RpcError::new().with_message(format!("{err}").as_str()))
+        } else {
+            Response::new().with_id(jsonrpc_id())
+        };
+
+        let res_str = serde_json::to_string(&res)? + "\n";
+
+        stream.write_all(res_str.as_bytes())?;
+
+        Ok(())
     }
 
     /// Acquires a lock on the serial port used for communication with the acceptor device.
@@ -1094,6 +1131,8 @@ impl DeviceHandle {
         let mut message = ssp::EnableCommand::new();
 
         let response = Self::poll_message(serial_port, &mut message, key)?;
+
+        set_enabled(true);
 
         response.into_enable_response()
     }
@@ -1519,6 +1558,38 @@ impl DeviceHandle {
         response.into_configure_bezel_response()
     }
 
+    /// Dispenses notes from the device by sending a [PayoutByDenominationCommand] message.
+    ///
+    /// **NOTE**: this command requires encryption mode.
+    ///
+    /// Parameters:
+    ///
+    /// - `list`: list of [`PayoutDenomination`] requests
+    ///
+    /// Returns:
+    ///
+    /// - `Ok(())`
+    /// - Err([`Error`](ssp::Error)) if an error occured
+    pub fn payout_by_denomination(&self, list: &ssp::PayoutDenominationList) -> Result<()> {
+        let mut serial_port = self.serial_port()?;
+        let mut message = ssp::PayoutByDenominationCommand::new().with_payout_denominations(list);
+
+        Self::payout_by_denomination_inner(&mut serial_port, &mut message, encryption_key!(self))
+    }
+
+    pub(crate) fn payout_by_denomination_inner(
+        serial_port: &mut TTYPort,
+        message: &mut ssp::PayoutByDenominationCommand,
+        key: Option<&ssp::AesKey>,
+    ) -> Result<()> {
+        let response = Self::poll_message(serial_port, message, key)?;
+
+        match response.as_response().response_status() {
+            ssp::ResponseStatus::Ok => Ok(()),
+            status => Err(ssp::Error::Status(status)),
+        }
+    }
+
     fn set_message_sequence_flag(message: &mut dyn CommandOps) {
         let mut sequence_id = message.sequence_id();
         sequence_id.set_flag(sequence_flag());
@@ -1542,7 +1613,7 @@ impl DeviceHandle {
         let mut attempt = 0;
         while let Err(_err) = serial_port.write_all(message.as_bytes()) {
             attempt += 1;
-            log::warn!("Failed to send message, attmept #{attempt}");
+            log::warn!("Failed to send message, attempt #{attempt}");
 
             thread::sleep(time::Duration::from_millis(MIN_POLLING_MS));
 
@@ -1583,6 +1654,7 @@ impl DeviceHandle {
         let mut wrapped = enc_cmd.encrypt(key);
 
         wrapped.calculate_checksum();
+
         log::trace!("Encrypted message: {wrapped}");
         log::trace!("Encrypted data: {:x?}", wrapped.data());
 
@@ -1593,7 +1665,12 @@ impl DeviceHandle {
         }
 
         let wrapped_res = response.into_wrapped_encrypted_message()?;
+        log::trace!("Encrypted response: {:x?}", wrapped_res.buf());
+
+        // received an encrypted response, decrypt and process
         let dec_res = ssp::EncryptedResponse::decrypt(key, wrapped_res);
+        log::trace!("Decrypted response: {dec_res}");
+        log::trace!("Decrypted data: {:x?}", dec_res.data());
 
         let mut res = ssp::MessageVariant::new(message.command());
         res.as_response_mut().set_data(dec_res.data())?;
