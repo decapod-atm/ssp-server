@@ -29,7 +29,7 @@ pub const LOCK_TIMEOUT_MS: u64 = 5_000;
 /// Timeout for waiting for serial communication (milliseconds).
 pub const SERIAL_TIMEOUT_MS: u64 = 10_000;
 /// Minimum polling interval between messages (milliseconds).
-pub const MIN_POLLING_MS: u64 = 200;
+pub const MIN_POLLING_MS: u64 = 500;
 /// Medium polling interval between messages (milliseconds).
 pub const MED_POLLING_MS: u64 = 650;
 /// Maximum polling interval between messages (milliseconds).
@@ -438,6 +438,7 @@ impl DeviceHandle {
                         now = time::Instant::now();
 
                         if resetting() {
+                            thread::sleep(time::Duration::from_secs(1));
                             continue;
                         }
 
@@ -451,7 +452,7 @@ impl DeviceHandle {
                             "Failed to lock encryption key in background polling routine"
                         );
 
-                        if (escrowed() && poll_mode == PollMode::Interactive) || enabled() {
+                        if escrowed() {
                             // Do not automatically poll when device has a bill in escrow,
                             // and the user is in interactive mode.
                             //
@@ -468,6 +469,8 @@ impl DeviceHandle {
                                 Self::poll_message(&mut locked_port, &mut message, key.as_ref()),
                                 "Failed hold command"
                             );
+
+                            thread::sleep(time::Duration::from_millis(MIN_POLLING_MS));
 
                             continue;
                         }
@@ -495,7 +498,7 @@ impl DeviceHandle {
                         }
                     }
 
-                    thread::sleep(time::Duration::from_millis(MIN_POLLING_MS / 3));
+                    thread::sleep(time::Duration::from_millis(MIN_POLLING_MS));
                 }
 
                 // Now that polling finished, reset the flag to allow another background routine to
@@ -703,6 +706,11 @@ impl DeviceHandle {
             let mut serial_port = self.serial_port()?;
             let key = self.encryption_key()?;
 
+            log::trace!(
+                "full status: {}",
+                self.setup_request_inner(&mut serial_port, key.as_ref())?
+            );
+
             (
                 self.unit_data_inner(&mut serial_port, key.as_ref())?,
                 Self::dataset_version_inner(&mut serial_port, key.as_ref())?,
@@ -768,11 +776,12 @@ impl DeviceHandle {
         serial_port.clear(serialport::ClearBuffer::All)?;
 
         while now.elapsed().as_secs() < RESET_TIMEOUT_SECS {
-            if let Ok(res) = self.sync_inner(&mut serial_port) {
+            if let Ok(res) = self.sync_inner(&mut serial_port, None) {
                 if res.response_status().is_ok() {
                     set_reset_time(0);
 
-                    if let Err(err) = self.enable_device_inner(&mut serial_port, protocol_version())
+                    if let Err(err) =
+                        self.enable_device_inner(&mut serial_port, protocol_version(), None)
                     {
                         log::error!("Error enabling device after reset: {err}");
                     }
@@ -911,14 +920,46 @@ impl DeviceHandle {
         Ok(())
     }
 
-    // Resets the Encryption key to none, requires a new key negotiation before performing eSSP
-    // operations.
-    fn reset_key(&mut self) -> Option<ssp::AesKey> {
+    /// Resets the Encryption key to none, requires a new key negotiation before performing eSSP
+    /// operations.
+    pub fn reset_key(&mut self) -> Option<ssp::AesKey> {
         if let Ok(mut key) = self.encryption_key() {
             key.take()
         } else {
             None
         }
+    }
+
+    fn status_res(res: &dyn ssp::ResponseOps) -> Result<()> {
+        let status = res.response_status();
+        if status.is_ok() {
+            Ok(())
+        } else {
+            Err(ssp::Error::Status(status))
+        }
+    }
+
+    /// Performs key negotiation to start a new eSSP session.
+    ///
+    /// Uses currently set [GeneratorKey] and [ModulusKey].
+    pub fn negotiate_key(&mut self) -> Result<()> {
+        Self::status_res(&self.sync()?)?;
+        Self::status_res(&self.set_generator()?)?;
+        Self::status_res(&self.set_modulus()?)?;
+        Self::status_res(&self.request_key_exchange()?)?;
+
+        Ok(())
+    }
+
+    /// Renegotiates the encryption key for a new eSSP session.
+    pub fn renegotiate_key(&mut self) -> Result<()> {
+        self.new_generator_key();
+        self.new_modulus_key();
+        self.new_random_key();
+
+        ssp::reset_sequence_count();
+
+        self.negotiate_key()
     }
 
     /// Sends a command to stack a bill in escrow.
@@ -1064,13 +1105,19 @@ impl DeviceHandle {
     pub fn sync(&self) -> Result<ssp::SyncResponse> {
         let mut serial_port = self.serial_port()?;
 
-        self.sync_inner(&mut serial_port)
+        self.sync_inner(&mut serial_port, encryption_key!(self))
     }
 
-    fn sync_inner(&self, serial_port: &mut TTYPort) -> Result<ssp::SyncResponse> {
+    fn sync_inner(
+        &self,
+        serial_port: &mut TTYPort,
+        key: Option<&ssp::AesKey>,
+    ) -> Result<ssp::SyncResponse> {
         let mut message = ssp::SyncCommand::new();
 
-        let response = Self::poll_message(serial_port, &mut message, encryption_key!(self))?;
+        set_sequence_flag(ssp::SequenceFlag::from(1));
+
+        let response = Self::poll_message(serial_port, &mut message, key)?;
 
         set_sequence_flag(ssp::SequenceFlag::from(0));
 
@@ -1084,37 +1131,35 @@ impl DeviceHandle {
     ) -> Result<ssp::EnableResponse> {
         let mut serial_port = self.serial_port()?;
 
-        self.enable_device_inner(&mut serial_port, protocol_version)
+        self.enable_device_inner(&mut serial_port, protocol_version, encryption_key!(self))
     }
 
     fn enable_device_inner(
         &self,
         serial_port: &mut TTYPort,
         protocol_version: ssp::ProtocolVersion,
+        key: Option<&ssp::AesKey>,
     ) -> Result<ssp::EnableResponse> {
-        self.poll_inner(serial_port, None)?;
+        self.host_protocol_version_inner(serial_port, protocol_version, key)?;
+        set_protocol_version(protocol_version);
 
-        // FIXME: make these *_inner functions accept a locked encryption key also to avoid
-        // deadlocks from locking and unlocking the mutex
-        let status_res = self.unit_data_inner(serial_port, None)?;
-        self.serial_number_inner(serial_port, None)?;
+        let status = self.setup_request_inner(serial_port, key)?;
+        log::trace!("Status: {status}");
 
-        if status_res.protocol_version() != protocol_version {
-            self.host_protocol_version_inner(serial_port, protocol_version, None)?;
-            set_protocol_version(protocol_version);
-        }
+        let serial = self.serial_number_inner(serial_port, key)?;
+        log::trace!("Serial number: {serial}");
+
+        let res = self.enable_inner(serial_port, key)?;
 
         let enable_list = ssp::EnableBitfieldList::from([
             ssp::EnableBitfield::from(0xff),
             ssp::EnableBitfield::from(0xff),
-            #[cfg(feature = "nv200")]
-            ssp::EnableBitfield::from(0xff),
         ]);
 
-        self.set_inhibits_inner(serial_port, enable_list, None)?;
-        self.channel_value_data_inner(serial_port, None)?;
+        self.set_inhibits_inner(serial_port, enable_list, key)?;
+        self.channel_value_data_inner(serial_port, key)?;
 
-        self.enable_inner(serial_port, None)
+        Ok(res)
     }
 
     /// Send a [EnableCommand](ssp::EnableCommand) message to the device.
@@ -1151,6 +1196,8 @@ impl DeviceHandle {
         let mut message = ssp::DisableCommand::new();
 
         let response = Self::poll_message(serial_port, &mut message, key)?;
+
+        set_enabled(false);
 
         response.into_disable_response()
     }
@@ -1360,13 +1407,17 @@ impl DeviceHandle {
     /// Send a [SetupRequestCommand](ssp::SetupRequestCommand) message to the device.
     pub fn setup_request(&self) -> Result<ssp::SetupRequestResponse> {
         let mut serial_port = self.serial_port()?;
-        self.setup_request_inner(&mut serial_port)
+        self.setup_request_inner(&mut serial_port, encryption_key!(self))
     }
 
-    fn setup_request_inner(&self, serial_port: &mut TTYPort) -> Result<ssp::SetupRequestResponse> {
+    fn setup_request_inner(
+        &self,
+        serial_port: &mut TTYPort,
+        key: Option<&ssp::AesKey>,
+    ) -> Result<ssp::SetupRequestResponse> {
         let mut message = ssp::SetupRequestCommand::new();
 
-        let response = Self::poll_message(serial_port, &mut message, encryption_key!(self))?;
+        let response = Self::poll_message(serial_port, &mut message, key)?;
 
         let res = response.into_setup_request_response()?;
 
@@ -1582,10 +1633,22 @@ impl DeviceHandle {
         message: &mut ssp::PayoutByDenominationCommand,
         key: Option<&ssp::AesKey>,
     ) -> Result<()> {
-        let response = Self::poll_message(serial_port, message, key)?;
+        let mut test_cmd = message
+            .with_payout_option(ssp::PayoutOption::TestPayoutAmount);
+        let test_res = Self::poll_message(serial_port, &mut test_cmd, key)?;
 
-        match response.as_response().response_status() {
-            ssp::ResponseStatus::Ok => Ok(()),
+        log::trace!("Test payout response: {test_res:?}");
+        thread::sleep(time::Duration::from_millis(50));
+
+        match test_res.as_response().response_status() {
+            ssp::ResponseStatus::Ok => {
+                let response = Self::poll_message(serial_port, message, key)?;
+
+                match response.as_response().response_status() {
+                    ssp::ResponseStatus::Ok => Ok(()),
+                    status => Err(ssp::Error::Status(status)),
+                }
+            }
             status => Err(ssp::Error::Status(status)),
         }
     }
@@ -1635,10 +1698,44 @@ impl DeviceHandle {
         serial_port.read_exact(buf[index::SEQ_ID..=index::LEN].as_mut())?;
 
         let buf_len = buf[index::LEN] as usize;
-        let remaining = index::DATA + buf_len + 2; // data + CRC-16 bytes
         let total = buf_len + ssp::len::METADATA;
+        let mut remaining = index::DATA + buf_len + 2; // data + CRC-16 bytes
 
         serial_port.read_exact(buf[index::DATA..remaining].as_mut())?;
+
+        log::trace!("Polled response: {:x?}", &buf[..remaining]);
+
+        // check for byte stuffing
+        let mut extra = buf[index::DATA..remaining]
+            .iter()
+            .filter(|&c| c == &ssp::STX)
+            .count()
+            / 2;
+
+        // read extra bytes off the buffer to account for byte stuffing
+        while extra != 0 {
+            log::trace!("Extra bytes: {extra}");
+            if remaining >= ssp::len::MAX_MESSAGE || remaining + extra >= ssp::len::MAX_MESSAGE {
+                return Err(ssp::Error::InvalidLength((
+                    remaining + extra,
+                    ssp::len::MAX_MESSAGE,
+                )));
+            }
+
+            serial_port.read_exact(buf[remaining..remaining + extra].as_mut())?;
+            extra = buf[remaining..remaining + extra]
+                .iter()
+                .filter(|&c| c == &ssp::STX)
+                .count()
+                / 2;
+            remaining = remaining.saturating_add(extra);
+        }
+
+        // remove any byte stuffing
+        if buf[index::DATA..remaining].contains(&ssp::STX) {
+            log::trace!("Polled response (with stuffing): {:x?}", &buf[..remaining]);
+            ssp::unstuff(buf[index::DATA..remaining].as_mut(), total - index::DATA)?;
+        }
 
         ssp::MessageVariant::from_buf(buf[..total].as_ref(), message.message_type())
     }
@@ -1652,8 +1749,23 @@ impl DeviceHandle {
         enc_cmd.set_message_data(message)?;
 
         let mut wrapped = enc_cmd.encrypt(key);
+        Self::set_message_sequence_flag(&mut wrapped);
 
+        // recalculate the checksum to include a possible change for the sequence flag
+        let is_stuffed = wrapped.is_stuffed();
+
+        // first, remove any byte stuffing
+        if is_stuffed {
+            wrapped.unstuff_encrypted_data()?;
+        }
+
+        // calculate the new checksum
         wrapped.calculate_checksum();
+
+        // re-add any byte stuffing
+        if is_stuffed {
+            wrapped.stuff_encrypted_data()?;
+        }
 
         log::trace!("Encrypted message: {wrapped}");
         log::trace!("Encrypted data: {:x?}", wrapped.data());
@@ -1670,10 +1782,10 @@ impl DeviceHandle {
         // received an encrypted response, decrypt and process
         let dec_res = ssp::EncryptedResponse::decrypt(key, wrapped_res);
         log::trace!("Decrypted response: {dec_res}");
-        log::trace!("Decrypted data: {:x?}", dec_res.data());
+        log::trace!("Decrypted data: {:x?}", dec_res.message_data());
 
         let mut res = ssp::MessageVariant::new(message.command());
-        res.as_response_mut().set_data(dec_res.data())?;
+        res.as_response_mut().set_data(dec_res.message_data())?;
         res.as_response_mut().calculate_checksum();
 
         Ok(res)

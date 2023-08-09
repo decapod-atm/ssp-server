@@ -25,6 +25,7 @@ fn main() -> ssp::Result<()> {
         socket_path.as_str(),
         Arc::clone(&stop),
         ssp::ProtocolVersion::Eight,
+        false,
     )?;
 
     while !stop.load(Ordering::Relaxed) {
