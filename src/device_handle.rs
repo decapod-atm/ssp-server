@@ -1633,8 +1633,7 @@ impl DeviceHandle {
         message: &mut ssp::PayoutByDenominationCommand,
         key: Option<&ssp::AesKey>,
     ) -> Result<()> {
-        let mut test_cmd = message
-            .with_payout_option(ssp::PayoutOption::TestPayoutAmount);
+        let mut test_cmd = message.with_payout_option(ssp::PayoutOption::TestPayoutAmount);
         let test_res = Self::poll_message(serial_port, &mut test_cmd, key)?;
 
         log::trace!("Test payout response: {test_res:?}");
