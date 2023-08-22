@@ -247,7 +247,14 @@ impl DeviceHandle {
                         "Failed to send UnsafeJam event"
                     );
                 }
-                _ => log::warn!("Unsupported event occurred: 0x{:02x}", data[idx]),
+                ssp::ResponseStatus::ChannelDisable => {
+                    log::trace!("All channels disabled");
+                    idx += 1;
+                }
+                _ => {
+                    log::warn!("Unsupported event occurred: 0x{:02x}", data[idx]);
+                    idx += 1;
+                }
             }
         }
 

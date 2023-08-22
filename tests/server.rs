@@ -1,7 +1,10 @@
 #[cfg(any(feature = "test-e2e", feature = "test-crypto"))]
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread, time,
 };
 
 mod common;
@@ -503,12 +506,6 @@ fn test_crypto_server() -> Result<(), Vec<ssp::Error>> {
         Err(err) => return Err(vec![err]),
     };
 
-    /*
-    handle
-        .start_background_polling(Arc::clone(&stop_polling))
-        .ok();
-        */
-
     let mut errs = Vec::with_capacity(48);
 
     match handle.sync() {
@@ -519,10 +516,10 @@ fn test_crypto_server() -> Result<(), Vec<ssp::Error>> {
         }
     }
 
-    match handle.host_protocol_version(ssp::ProtocolVersion::Eight) {
-        Ok(res) => log::debug!("Host protocol version command succeeded: {res}"),
+    match handle.sync() {
+        Ok(res) => log::debug!("Sync command succeeded: {res}"),
         Err(err) => {
-            log::error!("Host protocol version command failed: {err}");
+            log::error!("Failed sync command: {err}");
             errs.push(err);
         }
     }
@@ -551,20 +548,14 @@ fn test_crypto_server() -> Result<(), Vec<ssp::Error>> {
         }
     }
 
+    thread::sleep(time::Duration::from_millis(500));
+
     // Send messages that require encryption
 
-    match handle.empty() {
-        Ok(res) => log::debug!("Empty command succeeded: {res}"),
+    match handle.enable_device(ssp::ProtocolVersion::Six) {
+        Ok(res) => log::debug!("Enable device succeeded: {res}"),
         Err(err) => {
-            log::error!("Failed empty command: {err}");
-            errs.push(err);
-        }
-    };
-
-    match handle.smart_empty() {
-        Ok(res) => log::debug!("Smart empty command succeeded: {res}"),
-        Err(err) => {
-            log::error!("Failed smart empty command: {err}");
+            log::error!("Enable device failed: {err}");
             errs.push(err);
         }
     };

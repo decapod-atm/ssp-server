@@ -81,10 +81,15 @@ impl Server {
         socket_path: &str,
         stop_polling: Arc<AtomicBool>,
         protocol_version: ssp::ProtocolVersion,
+        encrypt: bool,
     ) -> Result<Self> {
-        let handle = DeviceHandle::new(serial_path)?;
-        let push_queue =
-            Some(handle.start_background_polling_with_queue(stop_polling, PollMode::Interactive)?);
+        let mut handle = DeviceHandle::new(serial_path)?;
+
+        if encrypt {
+            handle.sync()?;
+            handle.renegotiate_key()?;
+            thread::sleep(time::Duration::from_millis(500));
+        }
 
         // enable the device to fully configure
         let mut reset_count = 0;
@@ -105,6 +110,9 @@ impl Server {
 
         // disable again to allow client to decide when to begin accepting notes
         handle.disable()?;
+
+        let push_queue =
+            Some(handle.start_background_polling_with_queue(stop_polling, PollMode::Interactive)?);
 
         // ensure path exists for UNIX socket
         let path_dir = PathBuf::from(socket_path);
@@ -252,7 +260,7 @@ impl Server {
                                     stream.shutdown(Shutdown::Both)?;
                                     return Ok(());
                                 }
-                                _ => log::debug!("Handled method: {method})"),
+                                _ => log::debug!("Handled method: {method}"),
                             },
                             Err(err) => {
                                 log::warn!("Error handling request: {err}");

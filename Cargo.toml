@@ -22,7 +22,7 @@ serialport = { version = "4.2", default-features = false }
 signal-hook = "0.3"
 
 [dependencies.ssp]
-version = "0.4"
+version = "0.5"
 features = ["std"]
 
 [dependencies.serde_json]
@@ -31,7 +31,7 @@ features = ["std"]
 optional = true
 
 [dependencies.smol-jsonrpc]
-version = "0.1"
+version = "0.2"
 features = ["std"]
 optional = true
 
