@@ -59,6 +59,8 @@ static PROTOCOL_VERSION: AtomicU8 = AtomicU8::new(6);
 
 static INTERACTIVE: AtomicBool = AtomicBool::new(false);
 
+static DISPENSING: AtomicBool = AtomicBool::new(false);
+
 pub(crate) fn sequence_flag() -> ssp::SequenceFlag {
     SEQ_FLAG.load(Ordering::Relaxed).into()
 }
@@ -149,6 +151,14 @@ pub(crate) fn set_interactive(val: bool) -> bool {
     let last = interactive();
     INTERACTIVE.store(val, Ordering::SeqCst);
     last
+}
+
+pub(crate) fn dispensing() -> bool {
+    DISPENSING.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_dispensing(val: bool) {
+    DISPENSING.store(val, Ordering::SeqCst);
 }
 
 /// Polling interactivity mode.
@@ -475,6 +485,13 @@ impl DeviceHandle {
                             continue;
                         }
 
+                        if dispensing() {
+                            // Do not automatically poll when device is dispensing notes
+                            thread::sleep(time::Duration::from_millis(MIN_POLLING_MS));
+
+                            continue;
+                        }
+
                         let mut message = ssp::PollCommand::new();
 
                         let res = continue_on_err!(
@@ -586,6 +603,7 @@ impl DeviceHandle {
                     }
                 };
 
+                log::debug!("Message: {message:?}");
                 let event = ssp::Event::from(&message);
                 let method = event.method();
                 log::debug!("Message method: {method}");
@@ -594,8 +612,10 @@ impl DeviceHandle {
                 set_jsonrpc_id(jsonrpc_id);
 
                 match method {
-                    ssp::Method::Disable | ssp::Method::Stop => self.on_disable(stream, &event)?,
-                    ssp::Method::Enable | ssp::Method::Accept => self.on_enable(stream, &event)?,
+                    ssp::Method::Accept => self.on_enable(stream, &event)?,
+                    ssp::Method::Stop => self.on_disable(stream, &event)?,
+                    ssp::Method::Enable => self.on_enable_payout(stream, &event)?,
+                    ssp::Method::Disable => self.on_disable_payout(stream, &event)?,
                     ssp::Method::Reject => self.on_reject(stream, &event)?,
                     ssp::Method::Stack => self.on_stack(stream, &event)?,
                     ssp::Method::StackerFull => self.on_stacker_full(stream, &event)?,
@@ -622,8 +642,24 @@ impl DeviceHandle {
         let mut res = Response::from(ssp::Event::from(ssp::DisableEvent::new()));
         res.set_id(jsonrpc_id());
 
-        let mut res_str = serde_json::to_string(&res)?;
-        res_str += "\n";
+        let res_str = serde_json::to_string(&res)? + "\n";
+
+        stream.write_all(res_str.as_bytes())?;
+
+        Ok(())
+    }
+
+    /// Message handler for [Disable](ssp::Event::DisableEvent) events.
+    ///
+    /// Exposed to help with creating a custom message handler.
+    #[cfg(feature = "jsonrpc")]
+    pub fn on_disable_payout(&self, stream: &mut UnixStream, _event: &ssp::Event) -> Result<()> {
+        self.disable_payout()?;
+
+        let mut res = Response::from(ssp::Event::from(ssp::DisableEvent::new()));
+        res.set_id(jsonrpc_id());
+
+        let res_str = serde_json::to_string(&res)? + "\n";
 
         stream.write_all(res_str.as_bytes())?;
 
@@ -638,13 +674,32 @@ impl DeviceHandle {
         // perform full init sequence,
         // only sending EnableCommand does not bring the device online...
         let enable_event = ssp::EnableEvent::try_from(event)?;
-        self.enable_device(enable_event.protocol_version())?;
+        self.enable()?;
 
         let mut res = Response::from(ssp::Event::from(enable_event));
         res.set_id(jsonrpc_id());
 
-        let mut res_str = serde_json::to_string(&res)?;
-        res_str += "\n";
+        let res_str = serde_json::to_string(&res)? + "\n";
+
+        stream.write_all(res_str.as_bytes())?;
+
+        Ok(())
+    }
+
+    /// Message handler for [Enable](ssp::Event::EnableEvent) events.
+    ///
+    /// Exposed to help with creating a custom message handler.
+    #[cfg(feature = "jsonrpc")]
+    pub fn on_enable_payout(&self, stream: &mut UnixStream, event: &ssp::Event) -> Result<()> {
+        // perform full init sequence,
+        // only sending EnableCommand does not bring the device online...
+        let enable_event = ssp::EnableEvent::try_from(event)?;
+        self.enable_payout()?;
+
+        let mut res = Response::from(ssp::Event::from(enable_event));
+        res.set_id(jsonrpc_id());
+
+        let res_str = serde_json::to_string(&res)? + "\n";
 
         stream.write_all(res_str.as_bytes())?;
 
@@ -812,6 +867,11 @@ impl DeviceHandle {
         Err(ssp::Error::JsonRpc("failed to reset device".into()))
     }
 
+    /// Gets whether the device is currently dispensing notes.
+    pub fn dispensing(&self) -> bool {
+        dispensing()
+    }
+
     /// Message handle for dispense request using a
     /// [PayoutDenominationList](ssp::PayoutDenominationList).
     ///
@@ -820,15 +880,43 @@ impl DeviceHandle {
     /// Exposed to help with creating a custom message handler.
     #[cfg(feature = "jsonrpc")]
     pub fn on_dispense(&self, stream: &mut UnixStream, event: &ssp::Event) -> Result<()> {
-        let inner_event = event.payload().as_dispense_event()?;
+        log::trace!("Dispense event: {event:?}");
 
-        let res = if let Err(err) = self.payout_by_denomination(inner_event.as_inner()) {
+        let payload = event.payload();
+        log::trace!("PayoutByDenomination payload: {payload}");
+
+        let inner_event = payload.as_dispense_event()?;
+        log::trace!("PayoutByDenomination event: {inner_event}");
+
+        let payout_denom = inner_event.as_inner();
+        log::trace!("PayoutByDenomination request: {payout_denom}");
+
+        let mut serial_port = self.serial_port()?;
+        let key_guard = self.encryption_key()?;
+        let key = key_guard.as_ref();
+
+        self.enable_inner(&mut serial_port, key)?;
+        self.enable_payout_inner(&mut serial_port, key)?;
+
+        set_dispensing(true);
+
+        let mut payout =
+            ssp::PayoutByDenominationCommand::new().with_payout_denominations(payout_denom);
+
+        let res = if let Err(err) =
+            self.payout_by_denomination_inner(&mut serial_port, &mut payout, key)
+        {
             Response::new()
                 .with_id(jsonrpc_id())
                 .with_error(RpcError::new().with_message(format!("{err}").as_str()))
         } else {
             Response::new().with_id(jsonrpc_id())
         };
+
+        self.disable_payout_inner(&mut serial_port, key)?;
+        self.disable_inner(&mut serial_port, key)?;
+
+        set_dispensing(false);
 
         let res_str = serde_json::to_string(&res)? + "\n";
 
@@ -1151,6 +1239,12 @@ impl DeviceHandle {
 
         let res = self.enable_inner(serial_port, key)?;
 
+        let unit_type = status.unit_type().as_inner();
+        if (unit_type == 0x06 || unit_type == 0x07) && key.is_some() {
+            // if encryption mode is enabled, attempt to enable the device with EnablePayout
+            self.enable_payout_inner(serial_port, key)?;
+        }
+
         let enable_list = ssp::EnableBitfieldList::from([
             ssp::EnableBitfield::from(0xff),
             ssp::EnableBitfield::from(0xff),
@@ -1182,6 +1276,27 @@ impl DeviceHandle {
         response.into_enable_response()
     }
 
+    /// Send a [EnablePayoutCommand](ssp::EnablePayoutCommand) message to the device.
+    pub fn enable_payout(&self) -> Result<ssp::EnablePayoutResponse> {
+        let mut serial_port = self.serial_port()?;
+        self.enable_payout_inner(&mut serial_port, encryption_key!(self))
+    }
+
+    fn enable_payout_inner(
+        &self,
+        serial_port: &mut TTYPort,
+        key: Option<&ssp::AesKey>,
+    ) -> Result<ssp::EnablePayoutResponse> {
+        let mut message =
+            ssp::EnablePayoutCommand::new().with_option(ssp::EnablePayoutOption::from(0b11));
+
+        let response = Self::poll_message(serial_port, &mut message, key)?;
+
+        set_enabled(true);
+
+        response.into_enable_payout_response()
+    }
+
     /// Send a [DisableCommand](ssp::DisableCommand) message to the device.
     pub fn disable(&self) -> Result<ssp::DisableResponse> {
         let mut serial_port = self.serial_port()?;
@@ -1200,6 +1315,26 @@ impl DeviceHandle {
         set_enabled(false);
 
         response.into_disable_response()
+    }
+
+    /// Send a [DisablePayoutCommand](ssp::DisablePayoutCommand) message to the device.
+    pub fn disable_payout(&self) -> Result<ssp::DisablePayoutResponse> {
+        let mut serial_port = self.serial_port()?;
+        self.disable_payout_inner(&mut serial_port, encryption_key!(self))
+    }
+
+    fn disable_payout_inner(
+        &self,
+        serial_port: &mut TTYPort,
+        key: Option<&ssp::AesKey>,
+    ) -> Result<ssp::DisablePayoutResponse> {
+        let mut message = ssp::DisablePayoutCommand::new();
+
+        let response = Self::poll_message(serial_port, &mut message, key)?;
+
+        set_enabled(false);
+
+        response.into_disable_payout_response()
     }
 
     /// Send a [DisplayOffCommand](ssp::DisplayOffCommand) message to the device.
@@ -1623,12 +1758,15 @@ impl DeviceHandle {
     /// - Err([`Error`](ssp::Error)) if an error occured
     pub fn payout_by_denomination(&self, list: &ssp::PayoutDenominationList) -> Result<()> {
         let mut serial_port = self.serial_port()?;
-        let mut message = ssp::PayoutByDenominationCommand::new().with_payout_denominations(list);
+        let mut message = ssp::PayoutByDenominationCommand::new()
+            .with_payout_denominations(list)
+            .with_payout_option(ssp::PayoutOption::PayoutAmount);
 
-        Self::payout_by_denomination_inner(&mut serial_port, &mut message, encryption_key!(self))
+        self.payout_by_denomination_inner(&mut serial_port, &mut message, encryption_key!(self))
     }
 
     pub(crate) fn payout_by_denomination_inner(
+        &self,
         serial_port: &mut TTYPort,
         message: &mut ssp::PayoutByDenominationCommand,
         key: Option<&ssp::AesKey>,
@@ -1636,13 +1774,14 @@ impl DeviceHandle {
         let mut test_cmd = message.with_payout_option(ssp::PayoutOption::TestPayoutAmount);
         let test_res = Self::poll_message(serial_port, &mut test_cmd, key)?;
 
-        log::trace!("Test payout response: {test_res:?}");
+        log::trace!("Test payout response: {}", test_res.as_response());
         thread::sleep(time::Duration::from_millis(50));
 
         match test_res.as_response().response_status() {
             ssp::ResponseStatus::Ok => {
                 let response = Self::poll_message(serial_port, message, key)?;
 
+                log::trace!("Payout response: {}", response.as_response());
                 match response.as_response().response_status() {
                     ssp::ResponseStatus::Ok => Ok(()),
                     status => Err(ssp::Error::Status(status)),
@@ -1750,6 +1889,9 @@ impl DeviceHandle {
         let mut wrapped = enc_cmd.encrypt(key);
         Self::set_message_sequence_flag(&mut wrapped);
 
+        log::trace!("Encrypted message: {wrapped}");
+        log::trace!("Encrypted data: {:x?}", wrapped.data());
+
         // recalculate the checksum to include a possible change for the sequence flag
         let is_stuffed = wrapped.is_stuffed();
 
@@ -1766,14 +1908,12 @@ impl DeviceHandle {
             wrapped.stuff_encrypted_data()?;
         }
 
-        log::trace!("Encrypted message: {wrapped}");
-        log::trace!("Encrypted data: {:x?}", wrapped.data());
-
         let response = Self::poll_message_variant(serial_port, &mut wrapped)?;
 
         if response.as_response().response_status() == ssp::ResponseStatus::KeyNotSet {
             return Err(ssp::Error::Encryption(ssp::ResponseStatus::KeyNotSet));
         }
+        log::trace!("Raw response: {:x?}", response.as_response().buf());
 
         let wrapped_res = response.into_wrapped_encrypted_message()?;
         log::trace!("Encrypted response: {:x?}", wrapped_res.buf());
@@ -1796,8 +1936,10 @@ impl DeviceHandle {
         key: Option<&ssp::AesKey>,
     ) -> Result<ssp::MessageVariant> {
         if let Some(key) = key {
+            log::trace!("Polling encrypted message: {:x?}", message.buf());
             Self::poll_encrypted_message(serial_port, message, key)
         } else {
+            log::trace!("Polling clear-text message: {:x?}", message.buf());
             Self::poll_message_variant(serial_port, message)
         }
     }

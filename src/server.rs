@@ -109,7 +109,11 @@ impl Server {
         }
 
         // disable again to allow client to decide when to begin accepting notes
-        handle.disable()?;
+        if encrypt {
+            handle.disable_payout()?;
+        } else {
+            handle.disable()?;
+        }
 
         let push_queue =
             Some(handle.start_background_polling_with_queue(stop_polling, PollMode::Interactive)?);
