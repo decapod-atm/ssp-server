@@ -3,6 +3,8 @@
 pub mod device_handle;
 #[macro_use]
 mod macros;
+#[cfg(feature = "mock")]
+pub mod mock;
 mod server;
 
 pub use server::*;

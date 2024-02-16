@@ -240,6 +240,9 @@ impl DeviceHandle {
                     );
                     idx += ssp::UnsafeJamEvent::len();
 
+                    log::warn!(
+                        "Unsafe Jam occurred, please clear the jam from the device, and reset."
+                    );
                     set_escrowed(false);
 
                     continue_on_err!(

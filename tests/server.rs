@@ -8,11 +8,13 @@ use std::{
 };
 
 mod common;
+#[cfg(feature = "mock")]
+mod mock;
 
 #[cfg(feature = "test-e2e")]
 #[test]
 fn test_e2e_server() -> Result<(), Vec<ssp::Error>> {
-    common::init();
+    let _lock = common::init();
 
     let stop_polling = Arc::new(AtomicBool::new(false));
 
@@ -410,7 +412,7 @@ fn test_rainbow_dance() -> ssp::Result<()> {
         thread, time,
     };
 
-    common::init();
+    let _lock = common::init();
 
     let mut handle = ssp_server::DeviceHandle::new("/dev/ttyUSB0")?;
 

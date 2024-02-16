@@ -74,6 +74,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install libtinfo5
+      - name: Install socat
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install socat
       - name: Run all the tests (debug)
         env:
           GITHUB_ACTIONS_OS: ${{matrix.os}}
@@ -94,3 +99,9 @@ jobs:
           GITHUB_ACTIONS_OS: ${{matrix.os}}
           RUST_TARGET: ${{matrix.target.rust}}
         run: cargo test --all --release --features jsonrpc
+      - name: Run all the mock tests (release, mock)
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          GITHUB_ACTIONS_OS: ${{matrix.os}}
+          RUST_TARGET: ${{matrix.target.rust}}
+        run: cargo test --all --release --features mock
