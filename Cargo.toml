@@ -41,6 +41,7 @@ test-crypto = []
 test-e2e = []
 test-rainbow = []
 jsonrpc = ["serde_json", "smol-jsonrpc", "ssp/jsonrpc"]
+mock = []
 
 [lib]
 name = "ssp_server"
