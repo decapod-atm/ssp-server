@@ -61,6 +61,8 @@ static INTERACTIVE: AtomicBool = AtomicBool::new(false);
 
 static DISPENSING: AtomicBool = AtomicBool::new(false);
 
+static UNSAFE_JAM: AtomicBool = AtomicBool::new(false);
+
 pub(crate) fn sequence_flag() -> ssp::SequenceFlag {
     SEQ_FLAG.load(Ordering::Relaxed).into()
 }
@@ -159,6 +161,14 @@ pub(crate) fn dispensing() -> bool {
 
 pub(crate) fn set_dispensing(val: bool) {
     DISPENSING.store(val, Ordering::SeqCst);
+}
+
+pub(crate) fn unsafe_jam() -> bool {
+    UNSAFE_JAM.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_unsafe_jam(val: bool) {
+    UNSAFE_JAM.store(val, Ordering::SeqCst)
 }
 
 /// Polling interactivity mode.
@@ -331,6 +341,23 @@ impl DeviceHandle {
                             continue;
                         }
 
+                        if unsafe_jam() {
+                            log::debug!("Unsafe jam detected, resetting device...");
+                            let mut locked_port = continue_on_err!(
+                                Self::lock_serial_port(&serial_port),
+                                "Failed to lock serial port in background polling routine"
+                            );
+                            let mut message = ssp::ResetCommand::new();
+                            continue_on_err!(
+                                Self::poll_message_variant(&mut locked_port, &mut message),
+                                "Failed to reset device"
+                            );
+                            // Wait for device to reset
+                            thread::sleep(time::Duration::from_secs(15));
+                            set_unsafe_jam(false);
+                            continue;
+                        }
+
                         let mut locked_port = continue_on_err!(
                             Self::lock_serial_port(&serial_port),
                             "Failed to lock serial port in background polling routine"
@@ -364,6 +391,9 @@ impl DeviceHandle {
                             let last_statuses = poll_res.last_response_statuses();
 
                             log::debug!("Successful poll command, last statuses: {last_statuses}");
+                        } else if status == ssp::ResponseStatus::UnsafeJam {
+                            log::error!("Unsafe Jam detected! Please remove the jam from the device. Attempting an automatic device reset...");
+                            set_unsafe_jam(true);
                         } else {
                             log::warn!("Failed poll command, response status: {status}");
                         }
@@ -378,6 +408,8 @@ impl DeviceHandle {
 
                 Ok(())
             });
+
+            set_polling_inited(false);
 
             Ok(())
         }
@@ -452,6 +484,23 @@ impl DeviceHandle {
                             continue;
                         }
 
+                        if unsafe_jam() {
+                            log::debug!("Unsafe jam detected, resetting device...");
+                            let mut locked_port = continue_on_err!(
+                                Self::lock_serial_port(&serial_port),
+                                "Failed to lock serial port in background polling routine"
+                            );
+                            let mut message = ssp::ResetCommand::new();
+                            continue_on_err!(
+                                Self::poll_message_variant(&mut locked_port, &mut message),
+                                "Failed to reset device"
+                            );
+                            // Wait for device to reset
+                            thread::sleep(time::Duration::from_secs(15));
+                            set_unsafe_jam(false);
+                            continue;
+                        }
+
                         let mut locked_port = continue_on_err!(
                             Self::lock_serial_port(&serial_port),
                             "Failed to lock serial port in background polling routine"
@@ -510,6 +559,9 @@ impl DeviceHandle {
                         } else if status.to_u8() == 0 {
                             log::info!("Device returned a null response: {}", res.as_response());
                             log::trace!("Response data: {:x?}", res.as_response().buf());
+                        } else if status == ssp::ResponseStatus::UnsafeJam {
+                            log::error!("Unsafe Jam detected! Please remove the jam from the device. Attempting an automatic device reset...");
+                            set_unsafe_jam(true);
                         } else {
                             log::warn!("Failed poll command, response status: {status}");
                         }
@@ -524,6 +576,8 @@ impl DeviceHandle {
 
                 Ok(())
             });
+
+            set_polling_inited(false);
 
             Ok(PushEventReceiver::new(rx))
         }
