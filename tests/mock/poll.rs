@@ -22,6 +22,7 @@ fn test_poll() -> Result<()> {
         Ok(())
     });
 
+    // Wait for socat to start
     thread::sleep(time::Duration::from_secs(1));
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -40,7 +41,8 @@ fn test_poll() -> Result<()> {
 
     handle.start_background_polling(Arc::clone(&stop))?;
 
-    thread::sleep(time::Duration::from_secs(1));
+    // Wait long enough for multiple poll messages
+    thread::sleep(time::Duration::from_secs(5));
 
     stop.store(true, Ordering::SeqCst);
 
