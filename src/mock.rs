@@ -133,6 +133,47 @@ impl MockDevice {
         }
     }
 
+    /// Get the response data length.
+    pub fn response_data_len(msg_type: ssp::MessageType) -> usize {
+        match msg_type {
+            ssp::MessageType::SetInhibits => ssp::len::SET_INHIBITS_RESPONSE,
+            ssp::MessageType::DisplayOn => ssp::len::DISPLAY_ON_RESPONSE,
+            ssp::MessageType::DisplayOff => ssp::len::DISPLAY_OFF_RESPONSE,
+            ssp::MessageType::SetupRequest => ssp::len::SETUP_REQUEST_RESPONSE,
+            ssp::MessageType::HostProtocolVersion => ssp::len::HOST_PROTOCOL_VERSION_RESPONSE,
+            ssp::MessageType::Poll => ssp::len::POLL_RESPONSE,
+            ssp::MessageType::Reject => ssp::len::REJECT_RESPONSE,
+            ssp::MessageType::Disable => ssp::len::DISABLE_RESPONSE,
+            ssp::MessageType::Enable => ssp::len::ENABLE_RESPONSE,
+            ssp::MessageType::SerialNumber => ssp::len::SERIAL_NUMBER_RESPONSE,
+            ssp::MessageType::UnitData => ssp::len::UNIT_DATA_RESPONSE,
+            ssp::MessageType::ChannelValueData => ssp::len::CHANNEL_VALUE_DATA_RESPONSE,
+            ssp::MessageType::Synchronisation => ssp::len::SYNC_RESPONSE,
+            ssp::MessageType::LastRejectCode => ssp::len::LAST_REJECT_CODE_RESPONSE,
+            ssp::MessageType::Hold => ssp::len::HOLD_RESPONSE,
+            ssp::MessageType::DatasetVersion => ssp::len::DATASET_VERSION_RESPONSE,
+            ssp::MessageType::SetBarcodeReaderConfiguration => {
+                ssp::len::SET_BARCODE_READER_CONFIGURATION_RESPONSE
+            }
+            ssp::MessageType::GetBarcodeReaderConfiguration => {
+                ssp::len::GET_BARCODE_READER_CONFIGURATION_RESPONSE
+            }
+            ssp::MessageType::GetBarcodeInhibit => ssp::len::GET_BARCODE_INHIBIT_RESPONSE,
+            ssp::MessageType::SetBarcodeInhibit => ssp::len::SET_BARCODE_INHIBIT_RESPONSE,
+            ssp::MessageType::GetBarcodeData => ssp::len::GET_BARCODE_DATA_RESPONSE,
+            ssp::MessageType::Empty => ssp::len::EMPTY_RESPONSE,
+            ssp::MessageType::PayoutByDenomination => ssp::len::PAYOUT_BY_DENOMINATION_RESPONSE,
+            ssp::MessageType::SmartEmpty => ssp::len::SMART_EMPTY_RESPONSE,
+            ssp::MessageType::ConfigureBezel => ssp::len::CONFIGURE_BEZEL_RESPONSE,
+            ssp::MessageType::PollWithAck => ssp::len::POLL_WITH_ACK_RESPONSE,
+            ssp::MessageType::EventAck => ssp::len::EVENT_ACK_RESPONSE,
+            ssp::MessageType::DisablePayout => ssp::len::DISABLE_PAYOUT_RESPONSE,
+            ssp::MessageType::EnablePayout => ssp::len::ENABLE_PAYOUT_RESPONSE,
+            // FIXME: add support for encrypted message types...
+            _ => 1,
+        }
+    }
+
     /// Sends a default response message over the serial connection.
     pub fn send_default_response(&mut self) -> Result<()> {
         if let Some(mut res) = Self::default_response(self.msg_type) {
@@ -178,7 +219,7 @@ impl MockDevice {
 
                 if let Some(mut res) = Self::default_response(msg_type) {
                     res.set_response_status(self.response_status);
-                    res.set_data_len(1);
+                    res.set_data_len(Self::response_data_len(msg_type) as u8);
                     res.set_sequence_id(seq_id);
                     log::debug!("Writing response: {:x?}", res.as_bytes());
                     self.serial_port.write_all(res.as_bytes())?;
