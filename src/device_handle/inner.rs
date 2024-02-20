@@ -7,7 +7,8 @@ use ssp::MessageOps;
 use crate::continue_on_err;
 
 use super::{
-    cashbox_attached, set_cashbox_attached, set_escrowed, set_escrowed_amount, DeviceHandle,
+    cashbox_attached, set_cashbox_attached, set_escrowed, set_escrowed_amount, set_unsafe_jam,
+    DeviceHandle,
 };
 
 impl DeviceHandle {
@@ -244,6 +245,7 @@ impl DeviceHandle {
                         "Unsafe Jam occurred, please clear the jam from the device, and reset."
                     );
                     set_escrowed(false);
+                    set_unsafe_jam(true);
 
                     continue_on_err!(
                         tx.send(ssp::Event::from(event)),
