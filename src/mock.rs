@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time;
 
-use serialport::TTYPort;
+use serialport::{SerialPort, TTYPort};
 
 use ssp::{ResponseOps, Result};
 
@@ -153,16 +153,20 @@ impl MockDevice {
     pub fn serve(&mut self, stop: Arc<AtomicBool>) -> Result<()> {
         let mut buf = [0u8; ssp::len::MAX_MESSAGE];
         while !stop.load(Ordering::Relaxed) {
-            if self
-                .serial_port
-                .read_exact(&mut buf[..=ssp::message::index::LEN])
-                .is_ok()
+            if self.serial_port.bytes_to_read().unwrap_or(0) > 0
+                && self
+                    .serial_port
+                    .read_exact(&mut buf[..=ssp::message::index::LEN])
+                    .is_ok()
             {
+                log::debug!("Received host message");
                 let len = buf[ssp::message::index::LEN] as usize;
-                let rem = len + ssp::len::METADATA - ssp::message::index::LEN as usize;
+                let rem = len + ssp::message::index::LEN + 2;
 
                 self.serial_port
                     .read_exact(&mut buf[ssp::message::index::LEN..rem])?;
+
+                log::debug!("Receive message bytes: {:x?}", &buf[..rem]);
 
                 let msg_type: ssp::MessageType = if len > ssp::message::index::DATA {
                     buf[ssp::message::index::DATA].into()
@@ -170,10 +174,16 @@ impl MockDevice {
                     self.msg_type
                 };
 
+                let seq_id = !ssp::SequenceId::from(buf[ssp::message::index::SEQ_ID]);
+
                 if let Some(mut res) = Self::default_response(msg_type) {
                     res.set_response_status(self.response_status);
                     res.set_data_len(1);
+                    res.set_sequence_id(seq_id);
+                    log::debug!("Writing response: {:x?}", res.as_bytes());
                     self.serial_port.write_all(res.as_bytes())?;
+                    log::trace!("Successfully wrote response");
+                    self.serial_port.flush()?;
                 }
             }
             buf.iter_mut().for_each(|b| *b = 0);

@@ -1811,6 +1811,8 @@ impl DeviceHandle {
             message.sequence_id()
         );
 
+        log::trace!("Polled message: {:x?}", message.as_bytes());
+
         let mut attempt = 0;
         while let Err(_err) = serial_port.write_all(message.as_bytes()) {
             attempt += 1;
@@ -1826,7 +1828,12 @@ impl DeviceHandle {
 
         let mut buf = [0u8; ssp::len::MAX_MESSAGE];
 
-        serial_port.read_exact(buf[..index::SEQ_ID].as_mut())?;
+        serial_port
+            .read_exact(buf[..index::SEQ_ID].as_mut())
+            .map_err(|err| {
+                log::warn!("Error reading initial response bytes: {err}");
+                err
+            })?;
 
         let stx = buf[index::STX];
         if stx != ssp::STX {
