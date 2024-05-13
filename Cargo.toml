@@ -1,6 +1,6 @@
 [package]
 name = "ssp-server"
-version = "0.3.3"
+version = "0.4.0"
 edition = "2021"
 authors = ["SSP Rust Developers"]
 description = "Reference server implementation for the SSP/eSSP serial communication protocol"
