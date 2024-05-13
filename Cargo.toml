@@ -35,6 +35,9 @@ version = "0.2"
 features = ["std"]
 optional = true
 
+[dependencies.crossbeam]
+version = "0.8"
+
 [features]
 default = ["jsonrpc"]
 test-crypto = []
