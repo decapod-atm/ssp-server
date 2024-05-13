@@ -1,7 +1,6 @@
 //! Holds private implementations of [DeviceHandle] functionality.
 
-use std::sync::mpsc;
-
+use crossbeam::channel;
 use ssp::MessageOps;
 
 use crate::continue_on_err;
@@ -14,7 +13,7 @@ use super::{
 impl DeviceHandle {
     pub(crate) fn parse_events(
         poll_res: &ssp::PollResponse,
-        tx: &mpsc::Sender<ssp::Event>,
+        tx: &channel::Sender<ssp::Event>,
     ) -> ssp::Result<()> {
         let data = poll_res.data();
         let data_len = data.len();

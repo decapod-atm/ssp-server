@@ -3,13 +3,11 @@
 use std::io::{Read, Write};
 #[cfg(feature = "jsonrpc")]
 use std::os::unix::net::UnixStream;
-use std::sync::{
-    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
-    mpsc, Arc,
-};
-use std::thread;
-use std::time;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::Arc;
+use std::{thread, time};
 
+use crossbeam::channel;
 use parking_lot::{Mutex, MutexGuard};
 use serialport::TTYPort;
 
@@ -36,7 +34,7 @@ pub const MED_POLLING_MS: u64 = 650;
 #[allow(dead_code)]
 pub const MAX_POLLING_MS: u64 = 1_000;
 /// Timeout for retrieving an event from a queue (milliseconds)
-pub const QUEUE_TIMEOUT_MS: u128 = 50;
+pub const QUEUE_TIMEOUT_MS: u64 = 50;
 /// Default serial connection BAUD rate (bps).
 pub const BAUD_RATE: u32 = 9_600;
 
@@ -211,11 +209,11 @@ pub enum PollMode {
 /// # Ok(())
 /// # }
 /// ```
-pub struct PushEventReceiver(pub mpsc::Receiver<ssp::Event>);
+pub struct PushEventReceiver(pub channel::Receiver<ssp::Event>);
 
 impl PushEventReceiver {
     /// Creates a new [PushEventReceiver] from the provided `queue`.
-    pub fn new(queue: mpsc::Receiver<ssp::Event>) -> Self {
+    pub fn new(queue: channel::Receiver<ssp::Event>) -> Self {
         Self(queue)
     }
 
@@ -223,16 +221,9 @@ impl PushEventReceiver {
     ///
     /// Returns `Err(_)` if an event could not be retrieved before the timeout.
     pub fn pop_event(&self) -> Result<ssp::Event> {
-        let now = time::Instant::now();
-        let queue = &self.0;
-
-        while now.elapsed().as_millis() < QUEUE_TIMEOUT_MS {
-            if let Ok(evt) = queue.try_recv() {
-                return Ok(evt);
-            }
-        }
-
-        Err(ssp::Error::QueueTimeout)
+        self.0
+            .recv_timeout(time::Duration::from_millis(QUEUE_TIMEOUT_MS))
+            .map_err(|_| ssp::Error::QueueTimeout)
     }
 }
 
@@ -470,7 +461,7 @@ impl DeviceHandle {
             let end_polling = Arc::clone(&stop_polling);
             let key = Arc::clone(&self.key);
 
-            let (tx, rx) = mpsc::channel();
+            let (tx, rx) = channel::unbounded();
 
             thread::spawn(move || -> Result<()> {
                 let mut now = time::Instant::now();
@@ -586,7 +577,7 @@ impl DeviceHandle {
     fn poll_resetting(
         serial_port: &mut TTYPort,
         key: Option<&ssp::AesKey>,
-        tx: Option<&mpsc::Sender<ssp::Event>>,
+        tx: Option<&channel::Sender<ssp::Event>>,
     ) -> Result<()> {
         use std::ops::Sub;
 
